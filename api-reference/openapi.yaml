@@ -2541,13 +2541,13 @@ components:
       type: object
       description: >-
         One lead to create or update and enroll in the campaign. `external_id`
-        is the upsert key; at least one of `email` or `phone_number` must be
-        present so the campaign has a channel to reach the lead on.
+        is the upsert key. At least one of `email` or `phone_number` must be
+        a non-null value so the campaign has a channel to reach the lead on —
+        this is deliberately NOT a schema-level constraint: rows missing both
+        fail individually with the `missing_identifier` per-row error code,
+        so one bad row never rejects the rest of the batch.
       required:
         - external_id
-      anyOf:
-        - required: [email]
-        - required: [phone_number]
       properties:
         external_id:
           type: string
