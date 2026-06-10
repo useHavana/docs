@@ -1,0 +1,136 @@
+---
+title: "Statuses & Intents Reference"
+description: "Every lead status and classification intent the Havana API can return, what each one means in CRM terms, and how to map them into your pipeline."
+---
+
+This page is the complete reference for the two enumerations your CRM sync will encounter:
+
+- **Lead status** — the lead's overall position in the engagement lifecycle. Returned as `status` on every lead record, and announced by the `lead.status_changed` webhook event.
+- **Intent** — the classifier's read on a single interaction (a call, a message thread, an email reply). Returned as `intent` on activity, thread, and call records, and announced by the `lead.classified` webhook event.
+
+<Note>
+Classification is **asynchronous**. Every classifiable activity carries a `classification_status` of `pending` or `completed` alongside a nullable `intent`. A `call.completed` webhook fires immediately with classification still `pending`; the intent arrives later via `lead.classified`. Late classifications bump the lead's `updated_at`, so a daily `GET /api/v1/leads?updated_since=...` poll always picks them up — always upsert.
+</Note>
+
+Consumers must tolerate unknown values: new statuses and intents may be added without a version bump.
+
+## Lead statuses
+
+A lead has exactly one status at a time. Statuses are not strictly ordered — a lead can move from `replied` back to `unresponsive`, or jump straight from `contacted` to `unsubscribed`.
+
+| API value | Display name | What it means in CRM terms | Recommended CRM pipeline mapping |
+|---|---|---|---|
+| `not_started` | Not Started | The lead is loaded into Havana but no outreach has gone out yet. | **New / Open — Not Contacted.** No rep action needed. |
+| `contacted` | Contacted | Havana has reached out (call placed, message or email sent) but the lead has not responded yet. | **Working — Attempted to Contact.** Log the touch; no rep action needed. |
+| `replied` | Replied | The lead has engaged — answered a call, replied to a message or email — but has not yet expressed clear buying interest. Warm signals (asked for a callback, asked to be emailed) keep a lead here. | **Working — Engaged.** Havana is still working the lead; reps generally should not intervene yet. |
+| `interested` | Qualified | The lead expressed genuine interest and is handoff-ready — typically with a booked or requested time, or a completed transfer. This is the money status. | **Qualified / Sales-Ready.** Route to a rep immediately; create the opportunity or task your team works from. |
+| `not_interested` | Not Interested | The lead explicitly declined. They responded, so the data is good — they just said no. | **Closed — Not Converted (Lost: Not Interested).** Suppress from active outreach; eligible for long-term re-engagement per your own policy. |
+| `bounced` | Bounced | The contact data is bad — email bounced or the number is otherwise undeliverable. Nothing about the lead's interest is known. | **Closed — Invalid Contact Data.** Flag for data cleanup; do not count as a rejection. |
+| `unresponsive` | Unresponsive | Havana completed its outreach sequence and the lead never engaged. Contact data appears valid; they simply did not respond. | **Closed — Unresponsive / Nurture.** Move to a long-term nurture pool rather than a hard loss. |
+| `unsubscribed` | DNC/Unsubscribed | The lead opted out (said "stop", asked to be removed, or was marked do-not-contact). Havana will not contact them again. | **Do Not Contact.** Set your CRM's DNC / email-opt-out / SMS-opt-out flags. This is a compliance state — propagate it everywhere, never override it. |
+| `needs_human_review` | Needs Human Review | The AI hit something it should not handle alone — an ambiguous, sensitive, or escalation-worthy exchange. | **Open — Flagged for Review.** Create a task for a human to read the thread (`GET /api/v1/leads/{external_id}/thread`) and decide next steps. Keep the pipeline stage, add the flag. |
+| `intentionally_stopped` | Intentionally Stopped | Outreach was deliberately halted by an operator or a campaign rule — not by the lead's behavior. | **On Hold / Paused.** Keep the current pipeline stage; do not treat as lost or unresponsive. |
+
+### Status mapping tips
+
+- Treat `interested` as your trigger for rep routing. Everything before it is Havana's job; everything from `interested` onward is yours.
+- `unsubscribed` and `bounced` are terminal for outreach but mean very different things: one is a compliance obligation, the other is a data-quality problem. Map them to different closed reasons.
+- `needs_human_review` and `intentionally_stopped` are the two statuses where the right CRM move is *not* a stage change — they are flags layered on top of wherever the lead already is.
+
+## Intents
+
+Intents are channel-prefixed for voice and messaging (`voice_*`, `messaging_*`); email intents are unprefixed. One system-assigned intent, `intentionally_stopped`, can appear on activities of any channel. Each table below groups intents by **what a CRM user should do about them**.
+
+### Voice intents
+
+| Intent | Meaning | 
+|---|---|
+| **Positive interest — route to a rep** | |
+| `voice_interested` | Lead expressed clear interest on the call. |
+| `voice_interested_with_booked_time` | Lead is interested **and an appointment was booked** on the call. Sync the appointment (`GET /api/v1/leads/{external_id}/appointments`). |
+| `voice_interested_with_unbooked_time` | Lead is interested and proposed a time, but it was not confirmed/booked. A rep should lock it in. |
+| `voice_transferred_call` | The call was live-transferred to a human. Check the call's transfer outcome on `GET /api/v1/calls/{id}`. |
+| **Wants follow-up — schedule the next touch** | |
+| `voice_wants_call_back` | Lead asked to be called back. Warm, not yet qualified — Havana schedules the callback. |
+| `voice_wants_email_follow_up` | Lead asked to receive information by email. |
+| `voice_wants_whatsapp_sms_follow_up` | Lead asked to continue over WhatsApp/SMS. Treated as handoff-warm — the conversation moves channels. |
+| `voice_call_responded` | Lead answered and engaged, but expressed no specific ask yet. Conversation continues. |
+| **Negative — close out** | |
+| `voice_not_interested` | Lead explicitly declined on the call. |
+| **Compliance / DNC — set opt-out flags** | |
+| `voice_unsubscribed` | Lead asked not to be called again. Propagate to your CRM's DNC flags. |
+| **Operational noise — log only, no action** | |
+| `voice_voice_mail` | Call went to voicemail. |
+| `voice_incomplete_call` | Call connected but ended before a meaningful exchange. |
+| `voice_wrong_number` | The person who answered is not the lead. Flag the phone field for data cleanup. |
+| `voice_no_action` | Call completed with nothing actionable. |
+| `voice_unknown` | Classifier could not determine an intent. |
+| `voice_immediate_hangup` | Call answered and immediately hung up. |
+| `voice_callback_no_answer` | A scheduled callback was attempted and the lead did not pick up. |
+
+### Messaging intents (SMS / WhatsApp)
+
+| Intent | Meaning |
+|---|---|
+| **Positive interest — route to a rep** | |
+| `messaging_interested` | Lead expressed clear interest in the conversation. |
+| `messaging_interested_with_booked_time` | Lead is interested and an appointment was booked. Sync the appointment. |
+| `messaging_interested_with_unbooked_time` | Lead is interested and proposed a time that is not yet booked. A rep should confirm it. |
+| `messaging_forward_to_rep` | The conversation should be handed to a human rep (lead asked for a person, or the topic requires one). |
+| **Wants follow-up — schedule the next touch** | |
+| `messaging_wants_message_back` | Lead expects a reply in the same channel. |
+| `messaging_wants_call_back` | Lead asked to be called. Warm — Havana schedules the call. |
+| `messaging_wants_email_follow_up` | Lead asked for information by email. |
+| **Negative — close out** | |
+| `messaging_not_interested` | Lead explicitly declined. |
+| **Compliance / DNC — set opt-out flags** | |
+| `messaging_unsubscribed` | Lead opted out of messaging. Propagate to your CRM's SMS/WhatsApp opt-out flags. |
+| `messaging_immediate_stop` | Lead sent a hard stop keyword ("STOP"). Treated as an immediate opt-out — same compliance handling as `messaging_unsubscribed`. |
+| **Operational noise — log only, no action** | |
+| `messaging_wrong_number` | The recipient is not the lead. Flag the phone field for data cleanup. |
+| `messaging_no_action` | Exchange completed with nothing actionable. |
+| `messaging_unknown` | Classifier could not determine an intent. |
+| `messaging_needs_clarification` | Lead's message was ambiguous; the AI is asking a clarifying question. Conversation continues. |
+| `messaging_continue_campaign` | Nothing in the reply changes course; the campaign sequence continues as planned. |
+
+### Email intents
+
+| Intent | Meaning |
+|---|---|
+| **Positive interest — route to a rep** | |
+| `interested` | Lead's reply expressed clear interest. |
+| `forward_to_rep` | The reply should be handled by a human rep (lead asked for a person, or the topic requires one). |
+| **Wants follow-up — information requested** | |
+| `more_info` | Lead asked a general question or requested more information. Havana responds; a rep may want visibility. |
+| `more_info_pricing` | Lead asked specifically about pricing/cost. High-signal question — worth rep attention. |
+| `more_info_requirements` | Lead asked about requirements (eligibility, prerequisites, documents). |
+| `needs_clarification` | Lead's reply was ambiguous; the AI is asking a clarifying question. Conversation continues. |
+| **Negative — close out** | |
+| `not_interested` | Lead explicitly declined by email. |
+| `needs_full_scholarship` | Lead can only proceed with full funding — typically disqualifying. Map to a specific lost reason if your pipeline tracks affordability. |
+| `no_english` | Lead cannot communicate in the campaign language. Disqualifying for the current campaign; potentially routable if you support other languages. |
+| **Compliance / DNC — set opt-out flags** | |
+| `unsubscribed` | Lead asked to stop receiving email. Propagate to your CRM's email opt-out flag. |
+| **Operational noise — log only, no action** | |
+| `bounced` | The email bounced — bad address. Flag the email field for data cleanup. |
+| `unknown` | Classifier could not determine an intent. |
+| `no_action` | Reply contained nothing actionable (auto-replies, acknowledgements). |
+
+### System intents (any channel)
+
+| Intent | Meaning |
+|---|---|
+| **Operational noise — log only, no action** | |
+| `intentionally_stopped` | Written by Havana itself (not a classifier) when outreach on the thread was deliberately halted by an operator or a campaign rule — not by the lead's behavior. Can appear on activities of any channel. Do not change pipeline stage; the lead's `status` (also `intentionally_stopped`) is the lifecycle signal. |
+
+## How intents drive status
+
+You never have to compute status from intents — Havana does that and the lead's `status` field is the source of truth. As a rule of thumb:
+
+- **Positive-interest** intents move a lead to `interested` (Qualified).
+- **Wants-follow-up** intents keep a lead at `replied` — engaged and being worked, not yet handoff-ready.
+- **Negative** intents move a lead to `not_interested`.
+- **Compliance/DNC** intents move a lead to `unsubscribed` and stop all outreach.
+- **Operational-noise** intents generally do not change status on their own.
+
+When in doubt, sync the lead's `status` for pipeline stage and store the latest `intent` as a supporting field (e.g. a "Havana Last Intent" custom field) for rep context.

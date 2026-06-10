@@ -1,0 +1,298 @@
+---
+title: "Webhooks"
+description: "Thin, signed event notifications that accelerate time-sensitive moments. The pull API remains the source of truth."
+---
+
+Havana webhooks are **doorbells, not data**. Each delivery tells you *that* something happened to a lead — a call ended, a classification landed, a lead opted out — and carries just enough identifiers to fetch the full record from the [pull API](/guides/daily-crm-sync).
+
+If you only build the daily `updated_since` delta poll, you will never miss data. Add webhooks when you need to react in minutes instead of a day: routing a handoff to a rep, suppressing an unsubscribed lead, or syncing a classification the moment it lands.
+
+<Note>
+**Pull is the backbone; webhooks are accelerators.** A missed webhook is never data loss — your next `GET /api/v1/leads?updated_since=...` poll carries the same state. Design your integration so webhooks make it faster, not so webhooks make it correct.
+</Note>
+
+## Registering an endpoint
+
+Webhook endpoints are managed from the Havana dashboard: **Settings → API → Webhooks**.
+
+<Steps>
+  <Step title="Add your endpoint URL">
+    The URL must be **HTTPS** and publicly reachable. Redirects are not followed — a 3xx response counts as a failed delivery — so register the final URL.
+  </Step>
+  <Step title="Select event types">
+    Subscribe the endpoint to any subset of the five v1 events. You can register multiple endpoints with different event subscriptions (e.g. a dedicated endpoint that only receives `lead.unsubscribed` for your compliance pipeline).
+  </Step>
+  <Step title="Store the signing secret">
+    Each endpoint gets its own signing secret, shown once at creation. Store it in your secrets manager — you'll use it to verify the `X-Havana-Signature` header on every delivery. Secrets can be rotated from the dashboard; during rotation, deliveries are signed with both the old and new secret (see [Verifying signatures](#verifying-signatures)).
+  </Step>
+  <Step title="Send a test delivery">
+    Use the **Send test event** button to deliver a sample payload and confirm your endpoint acknowledges with a 2xx and verifies the signature correctly.
+  </Step>
+</Steps>
+
+### Endpoint requirements
+
+- **Respond with any 2xx within 10 seconds.** Anything else — non-2xx status, redirect, timeout, connection error — is treated as a failed delivery and retried.
+- **Acknowledge first, process later.** Persist the event to a queue and return 200 immediately. Doing real work (API calls back to Havana, CRM writes) inline is the most common cause of timeout-driven duplicate deliveries.
+- The response body is ignored.
+
+## The five v1 events
+
+Every event shares the same thin envelope:
+
+```json
+{
+  "id": "evt20260610zk3m8p2r7t4v9x",
+  "type": "call.completed",
+  "sequence": 5,
+  "occurred_at": "2026-06-10T14:27:11Z",
+  "data": {
+    "lead_id": "led20260512zr7k2m4xq9p3v",
+    "external_id": "00Q5f000001AbCdEAV",
+    "call_id": "vca20260610z9d4w7n2q5ke",
+    "call_status": "completed",
+    "is_callback": false,
+    "classification_status": "pending",
+    "intent": null
+  }
+}
+```
+
+- `id` — unique event ID. Deduplicate on it: delivery is **at-least-once**, so you will occasionally see the same event twice.
+- `type` — one of the five event types below.
+- `sequence` — per-lead monotonic sequence number (see [Sequence numbers](#per-lead-sequence-numbers)).
+- `occurred_at` — when the underlying event happened in Havana.
+- `data` — identifiers (`lead_id`, `external_id` — your CRM's record ID, present on every event) plus the minimal fields describing what changed. Never full resource state.
+
+### `lead.status_changed`
+
+Fires whenever a lead's thread status transitions, e.g. `not_started` → `contacted` → `replied` → `interested`. `data.status` and `data.previous_status` carry the transition.
+
+Two adjacency notes:
+
+- A transition to `unsubscribed` **also** emits a dedicated `lead.unsubscribed` event.
+- A transition to `interested` (displayed as "Qualified" in the dashboard) is often immediately preceded by the `lead.classified` event that caused it — use `sequence` to order the pair.
+
+On receipt: pull `GET /api/v1/leads/{external_id}` for full lead state.
+
+### `lead.classified`
+
+Fires when the **async classifier** finishes classifying an engagement (call, message thread, or email reply). `data.intent` carries the resolved intent for the activity's channel — `voice_*` for calls, `messaging_*` for SMS/WhatsApp, unprefixed for email — and `data.call_id` / `data.activity_id` identify the classified engagement.
+
+Classification is asynchronous: a `call.completed` event fires first with `classification_status: pending`, and `lead.classified` follows once the classifier lands — typically within minutes. Late classifications also bump the lead's `updated_at`, so your delta poll picks them up even without this event.
+
+On receipt: pull `GET /api/v1/calls/{id}` or `GET /api/v1/leads/{external_id}/activities` for the full record.
+
+### `call.completed`
+
+Fires **immediately** when a voice call ends — before the classifier has run. `data.classification_status` is therefore always `pending` and `data.intent` is always `null`. `data.call_status` carries the terminal delivery status (`completed`, `no_answer`, ...) and `data.is_callback` tells you whether this was a scheduled callback rather than an immediate campaign dial.
+
+<Warning>
+Do not wait on `call.completed` for intent — it will never be there. If you only care about the classified outcome, consume `lead.classified` instead (or just rely on your delta poll).
+</Warning>
+
+On receipt: pull `GET /api/v1/calls/{id}` for the transcript, recording URL, duration, transfer outcome, and (once available) intent.
+
+### `lead.unsubscribed`
+
+Fires when a lead opts out of contact on any channel and their thread status moves to `unsubscribed` (DNC). Emitted **in addition to** the corresponding `lead.status_changed` event, so opt-out consumers can subscribe to one unambiguous signal. `data.channel` is `voice`, `sms`, `whatsapp`, or `email`; `data.intent` (when known) is the classifier intent that triggered the opt-out, e.g. `messaging_unsubscribed`.
+
+This event is time-sensitive: suppress the record in your CRM promptly to stay compliant. As with every event, your next delta poll carries the same state if delivery fails.
+
+### `handoff.requested`
+
+Fires when an engagement is classified with a handoff-shaped intent — the lead asked for a person, requested a callback, or was transferred. Triggering intents: `voice_wants_call_back`, `voice_transferred_call`, `voice_callback_no_answer`, `messaging_wants_call_back`, `messaging_forward_to_rep`, and `forward_to_rep` (email).
+
+Because handoff intents come from the async classifier, this event always **follows** the underlying `call.completed` (or message activity) rather than firing mid-engagement. It is the "your rep should act now" accelerator.
+
+On receipt: pull `GET /api/v1/calls/{id}` (voice) or `GET /api/v1/leads/{external_id}/thread` for the conversation context your rep needs, and `GET /api/v1/leads/{external_id}/appointments` for any booked time — `data.appointment_id` is set when the handoff carries a scheduled callback.
+
+## Verifying signatures
+
+Every delivery is signed with **HMAC-SHA256** and the signature arrives in the `X-Havana-Signature` header:
+
+```
+X-Havana-Signature: t=1781000000,v1=5f7a2c0d9e8b1a4c6d3e2f1a0b9c8d7e6f5a4b3c2d1e0f9a8b7c6d5e4f3a2b1c
+```
+
+- `t` is the Unix timestamp Havana attached at signing time.
+- `v1` is `hex(hmac_sha256(secret, "<t>.<raw_body>"))` — the HMAC is computed over the timestamp, a literal `.`, and the **raw, unmodified request body bytes**.
+- During secret rotation, the header may contain **multiple `v1=` values**; a match on any one is valid.
+
+To verify: recompute the HMAC with your endpoint's signing secret, compare against each `v1` value using a **constant-time comparison**, and reject deliveries whose timestamp is older than **5 minutes** (replay protection). Reject anything that fails verification before touching the payload.
+
+<Warning>
+Verify against the **raw body bytes**, not a re-serialized parse. JSON parsers reorder keys and normalize whitespace, which changes the bytes and breaks the HMAC. In Express, capture the raw body with a `verify` hook; in Flask, use `request.get_data()` before anything reads the stream.
+</Warning>
+
+<CodeGroup>
+
+```python verify.py
+import hashlib
+import hmac
+import time
+
+
+def verify_havana_signature(raw_body: bytes, signature_header: str, secret: str,
+                            tolerance_seconds: int = 300) -> bool:
+    """Verify an X-Havana-Signature header. raw_body must be the exact request bytes."""
+    pairs = dict()
+    v1_candidates = []
+    for part in signature_header.split(","):
+        key, _, value = part.strip().partition("=")
+        if key == "v1":
+            v1_candidates.append(value)
+        else:
+            pairs[key] = value
+
+    timestamp = pairs.get("t")
+    if timestamp is None or not v1_candidates:
+        return False
+
+    # Replay protection: reject signatures older than the tolerance window.
+    if abs(time.time() - int(timestamp)) > tolerance_seconds:
+        return False
+
+    signed_payload = f"{timestamp}.".encode() + raw_body
+    expected = hmac.new(secret.encode(), signed_payload, hashlib.sha256).hexdigest()
+
+    # Multiple v1 values may be present during secret rotation; any match is valid.
+    return any(hmac.compare_digest(expected, candidate) for candidate in v1_candidates)
+
+
+# --- Flask usage ---
+# from flask import Flask, request, abort
+#
+# app = Flask(__name__)
+# SECRET = os.environ["HAVANA_WEBHOOK_SECRET"]
+#
+# @app.post("/webhooks/havana")
+# def havana_webhook():
+#     raw = request.get_data()  # raw bytes, before JSON parsing
+#     if not verify_havana_signature(raw, request.headers.get("X-Havana-Signature", ""), SECRET):
+#         abort(400)
+#     event = json.loads(raw)
+#     enqueue(event)        # persist, then ack — process out of band
+#     return "", 200
+```
+
+```javascript verify.js
+const crypto = require("crypto");
+
+/**
+ * Verify an X-Havana-Signature header.
+ * rawBody must be the exact request body (Buffer or string), not a re-serialized parse.
+ */
+function verifyHavanaSignature(rawBody, signatureHeader, secret, toleranceSeconds = 300) {
+  const v1Candidates = [];
+  let timestamp = null;
+  for (const part of signatureHeader.split(",")) {
+    const idx = part.indexOf("=");
+    if (idx === -1) continue;
+    const key = part.slice(0, idx).trim();
+    const value = part.slice(idx + 1).trim();
+    if (key === "t") timestamp = value;
+    if (key === "v1") v1Candidates.push(value);
+  }
+  if (!timestamp || v1Candidates.length === 0) return false;
+
+  // Replay protection: reject signatures older than the tolerance window.
+  if (Math.abs(Date.now() / 1000 - Number(timestamp)) > toleranceSeconds) return false;
+
+  const expected = crypto
+    .createHmac("sha256", secret)
+    .update(`${timestamp}.`)
+    .update(rawBody)
+    .digest("hex");
+
+  // Multiple v1 values may be present during secret rotation; any match is valid.
+  return v1Candidates.some((candidate) => {
+    const a = Buffer.from(expected, "hex");
+    const b = Buffer.from(candidate, "hex");
+    return a.length === b.length && crypto.timingSafeEqual(a, b);
+  });
+}
+
+// --- Express usage ---
+// const express = require("express");
+// const app = express();
+// const SECRET = process.env.HAVANA_WEBHOOK_SECRET;
+//
+// app.post(
+//   "/webhooks/havana",
+//   express.json({ verify: (req, _res, buf) => { req.rawBody = buf; } }),
+//   (req, res) => {
+//     const sig = req.get("X-Havana-Signature") || "";
+//     if (!verifyHavanaSignature(req.rawBody, sig, SECRET)) {
+//       return res.status(400).send("invalid signature");
+//     }
+//     enqueue(req.body); // persist, then ack — process out of band
+//     res.sendStatus(200);
+//   }
+// );
+
+module.exports = { verifyHavanaSignature };
+```
+
+</CodeGroup>
+
+## Retries, dead-lettering, and redelivery
+
+Delivery is **at-least-once**. Havana considers a delivery successful only when your endpoint returns a 2xx within 10 seconds.
+
+**Retries.** Any failure — non-2xx status, 3xx redirect, timeout, or connection error — is retried with **exponential backoff: roughly 8 attempts spread over 72 hours**. The first retries come quickly (seconds to minutes); later attempts back off to multi-hour gaps. The event's `sequence` and payload do not change across retries; only the delivery attempt repeats.
+
+**Dead-lettering.** After the final failed attempt, the event moves to your endpoint's dead-letter queue with **14-day retention**. Dead-lettered events are visible in the dashboard (**Settings → API → Webhooks → endpoint → Failed deliveries**) along with the response status and body Havana saw on each attempt.
+
+**Redelivery.** Within the 14-day window you can redeliver dead-lettered events manually from the dashboard or via the API. Redelivered events keep their original `id`, `sequence`, and `occurred_at` — your idempotent processing (dedupe on `id`) and sequence checks handle them like any other duplicate or late arrival.
+
+<Tip>
+If your endpoint was down for longer than the retry window, don't replay the dead-letter queue event by event — just run a delta poll with `updated_since` set to before the outage. The pull API already has everything the missed events pointed at. Dead-letter redelivery is for surgical cases (e.g. re-triggering a handoff workflow), not for state recovery.
+</Tip>
+
+## Per-lead sequence numbers
+
+Every event carries a `sequence`: a **monotonically increasing number scoped to the lead** (`data.lead_id`). Retries, concurrent deliveries, and redeliveries mean events for the same lead can arrive at your endpoint **out of order** — a `lead.classified` retry can land after the `lead.status_changed` it caused, or vice versa.
+
+The sequence number gives you a payload-free ordering rule:
+
+1. Track, per lead, the highest `sequence` you have processed.
+2. When an event arrives with a `sequence` **lower than or equal to** that high-water mark, it is stale or a duplicate — acknowledge it with a 2xx and discard it.
+3. When it is higher, process it and advance the mark.
+
+```text
+seq 5  call.completed       → process, mark = 5
+seq 7  lead.status_changed  → process, mark = 7
+seq 6  lead.classified      → stale (6 < 7): ack 200, discard, re-fetch covers it
+```
+
+Two rules of thumb:
+
+- **Gaps are normal.** Sequence numbers may skip values (e.g. events for types your endpoint isn't subscribed to). A gap is not a missed delivery and not an error — never block waiting for a missing number.
+- **Discarding is safe precisely because payloads are thin.** A stale event carries no state you need; whatever it announced is already reflected in the resource you fetch (or fetched) from the pull API.
+
+You can also deduplicate exact redeliveries on the event `id`, or on the pair (`lead_id`, `sequence`) — both identify a unique event.
+
+## Why payloads are thin
+
+Havana webhook events deliberately carry **identifiers, not resource state**: event type, `external_id` + Havana IDs, the per-lead `sequence`, `occurred_at`, and the minimal fields describing what changed. On receipt, you re-fetch from the pull API.
+
+This is a correctness decision, not a bandwidth one. Fat payloads create an entire class of bugs by construction:
+
+- **Stale overwrites.** A retried fat payload from Tuesday arriving on Thursday would carry Tuesday's lead state. If you write webhook bodies into your CRM, a late retry silently rolls back newer data. Thin events can't do this — there is no state to write.
+- **Ordering races.** With fat payloads, out-of-order delivery forces you to diff payloads to decide which is newer. With thin events, the rule is one integer comparison on `sequence`, and the answer to "what is the current state?" is always the same: fetch it.
+- **Schema coupling.** Every field added to a resource would become a webhook contract change. Thin envelopes let the pull API evolve additively without touching the event shape.
+- **One code path.** Your daily delta poll and your webhook handler converge on the same upsert logic: *given an `external_id`, fetch current state and write it to the CRM*. The webhook just runs that path early for one lead.
+
+The pattern in practice:
+
+```text
+webhook arrives ──► verify signature ──► dedupe (id) ──► sequence check
+                                                            │
+                                              stale? ack + discard
+                                                            │
+                                          fresh? enqueue: fetch GET /api/v1/... 
+                                                  └► upsert into CRM (same code as daily poll)
+```
+
+A webhook consumer built this way is impossible to corrupt with duplicates, reorders, or replays — and if it goes down entirely, the daily poll quietly repairs everything.

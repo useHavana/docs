@@ -1,0 +1,272 @@
+---
+title: "Daily CRM sync"
+sidebarTitle: "Daily CRM sync"
+description: "The end-to-end recipe for writing Havana lead data back into your CRM with a daily delta poll."
+icon: "arrows-rotate"
+---
+
+This is the centerpiece integration pattern for the Havana API: **once a day, poll for every lead that changed, and upsert each one into your CRM.** No webhooks required. A complete sync is four steps:
+
+1. Poll `GET /api/v1/leads?updated_since=<last sync>` and page through with `cursor`.
+2. Upsert each lead into your CRM, keyed on `external_id` — the record ID *your* CRM assigned.
+3. Map Havana's `status` values onto your CRM's pipeline stages.
+4. Persist a new sync watermark and stop.
+
+Pending classifications take care of themselves: when Havana's async classifier finishes a call or message, it bumps the lead's `updated_at`, so the lead simply reappears in your next poll with the final intent. You never have to chase a classification.
+
+<Info>
+**Pull is the backbone; webhooks are accelerators.** Webhook events like `call.completed` and `lead.classified` are thin notifications (IDs + a sequence number) for time-sensitive moments. Everything they announce also flows through this poll. A missed webhook is never data loss.
+</Info>
+
+## Prerequisites
+
+- A Havana API key (`hav_...`), passed as `Authorization: Bearer hav_...`. Keys are per-team; you only ever see your own leads.
+- Leads imported into Havana with your CRM record ID, so `external_id` is populated on every record.
+
+## The sync loop
+
+<Steps>
+<Step title="Poll for changed leads">
+
+Request every lead whose `updated_at` is at or after your last sync time. Results are ordered by `updated_at` ascending and cursor-paginated.
+
+```bash First page
+curl "https://api.usehavana.com/api/v1/leads?updated_since=2026-06-09T00:00:00Z&limit=100" \
+  -H "Authorization: Bearer hav_your_api_key"
+```
+
+```json Response (truncated)
+{
+  "data": [
+    {
+      "id": "led20260512zr7k2m4xq9p3v",
+      "external_id": "00Q5f000001AbCdEAV",
+      "status": "interested",
+      "intent": "voice_interested_with_booked_time",
+      "first_name": "Maria",
+      "last_name": "Santos",
+      "unsubscribed": false,
+      "counts": {
+        "calls": 4,
+        "calls_answered": 1,
+        "emails_sent": 3,
+        "messages_received": 1
+      },
+      "created_at": "2026-05-12T09:30:00Z",
+      "updated_at": "2026-06-09T18:45:31Z"
+    }
+  ],
+  "next_cursor": "eyJ1cGRhdGVkX2F0IjoiMjAyNi0wNi0wOVQxODo0NTozMVoifQ",
+  "has_more": true
+}
+```
+
+While `next_cursor` is non-null, pass it back as `cursor` to fetch the next page. Keep `updated_since` the same on every page of a single sync run.
+
+```bash Subsequent pages
+curl "https://api.usehavana.com/api/v1/leads?updated_since=2026-06-09T00:00:00Z&limit=100&cursor=eyJ1cGRhdGVkX2F0IjoiMjAyNi0wNi0wOVQxODo0NTozMVoifQ" \
+  -H "Authorization: Bearer hav_your_api_key"
+```
+
+When `next_cursor` is `null`, the run is complete. For your very first sync (the initial backfill), omit `updated_since` entirely and page through the full lead set.
+
+</Step>
+<Step title="Upsert into your CRM, keyed on external_id">
+
+For each lead in `data`, write it into your CRM using `external_id` as the match key — it's the ID your CRM assigned, which Havana captured at import time and returns on every record and event. **Always upsert, never insert:** the same lead can (and will) appear in multiple polls as its engagement data and classifications evolve.
+
+Typical fields to write back:
+
+| Havana field | What it gives you |
+|---|---|
+| `status` | Pipeline stage (map it — see next step) |
+| `intent` | Latest classified intent across all channels |
+| `unsubscribed` | DNC flag — suppress the record when `true` |
+| `counts.*` | Per-channel engagement counters (`calls`, `calls_answered`, `emails_sent`, `email_opens`, `messages_received`, ...) |
+| `updated_at` | Your delta-sync watermark |
+
+<Note>
+`external_id` can be `null` for leads created without a CRM reference (manual or inbound-originated leads). Decide a policy up front: skip them, or create new CRM records keyed on Havana's `id`.
+</Note>
+
+</Step>
+<Step title="Map LeadStatus to your pipeline stages">
+
+Havana's `status` enum is stable and snake_case. Map each value onto whatever your pipeline calls it. A typical Salesforce-style mapping:
+
+| Havana `status` | Dashboard name | Example CRM stage |
+|---|---|---|
+| `not_started` | Not Started | New |
+| `contacted` | Contacted | Working - Attempted |
+| `replied` | Replied | Working - Engaged |
+| `interested` | **Qualified** | Qualified / SQL |
+| `not_interested` | Not Interested | Closed - Not Interested |
+| `bounced` | Bounced | Closed - Bad Contact Info |
+| `unresponsive` | Unresponsive | Closed - Unresponsive |
+| `unsubscribed` | DNC/Unsubscribed | Do Not Contact |
+| `needs_human_review` | Needs Human Review | Needs Review (route to a rep) |
+| `intentionally_stopped` | Intentionally Stopped | On Hold |
+
+Two values deserve care: `interested` displays as **"Qualified"** in the Havana dashboard, and `unsubscribed` is a compliance signal — make sure it lands in a stage that suppresses outreach in your CRM.
+
+</Step>
+<Step title="Persist the watermark">
+
+After the last page, store the `updated_at` of the last record you processed, **minus a small overlap window (e.g. 5 minutes)**, as the next run's `updated_since`. The overlap deliberately re-fetches a few leads at the boundary; because step 2 is an upsert, re-processing them is harmless.
+
+</Step>
+</Steps>
+
+## Pending classifications resolve themselves
+
+Havana classifies engagements **asynchronously**. A call can complete — and the lead surface in one poll — before the classifier has assigned an intent. Here is the same activity across two consecutive daily polls, fetched from `GET /api/v1/leads/{external_id}/activities`:
+
+<CodeGroup>
+
+```json Day 1 — classification pending
+{
+  "id": "act20260609zq8w3e7r2t9yu",
+  "external_id": "00Q5f000001AbCdEAV",
+  "type": "call",
+  "channel": "voice",
+  "direction": "outbound",
+  "occurred_at": "2026-06-09T14:21:47Z",
+  "classification_status": "pending",
+  "intent": null,
+  "summary": null,
+  "call_id": "vca20260609z8h3n6tq2w5dy"
+}
+```
+
+```json Day 2 — classifier landed
+{
+  "id": "act20260609zq8w3e7r2t9yu",
+  "external_id": "00Q5f000001AbCdEAV",
+  "type": "call",
+  "channel": "voice",
+  "direction": "outbound",
+  "occurred_at": "2026-06-09T14:21:47Z",
+  "classification_status": "completed",
+  "intent": "voice_interested_with_booked_time",
+  "summary": "Lead confirmed interest and booked a callback for Tuesday 2pm CT.",
+  "call_id": "vca20260609z8h3n6tq2w5dy"
+}
+```
+
+</CodeGroup>
+
+Notice what did *not* change: the activity's `id` and `occurred_at`. What did change: `classification_status` flipped to `completed`, `intent` and `summary` were populated — and crucially, the parent lead's `updated_at` was **bumped** when the classification landed. That bump is the whole mechanism: the lead falls inside your next `updated_since` window, your poll picks it up, and your upsert overwrites the stale pending state. You do nothing special. `pending` simply means "not final yet — the next poll will carry the answer."
+
+This is also why you should never filter `pending` activities out and forget them, and never treat a `call.completed` webhook (which always arrives with `classification_status: pending` and `intent: null`) as the call's final outcome.
+
+## Worked example: a complete sync in Python
+
+A minimal but production-shaped daily sync. It pages with cursors, upserts on `external_id`, maps statuses, and persists an overlapped watermark.
+
+```python daily_sync.py
+import time
+
+import requests
+from datetime import datetime, timedelta
+
+API_BASE = "https://api.usehavana.com"
+API_KEY = "hav_your_api_key"
+HEADERS = {"Authorization": f"Bearer {API_KEY}"}
+
+STATUS_TO_STAGE = {
+    "not_started": "New",
+    "contacted": "Working - Attempted",
+    "replied": "Working - Engaged",
+    "interested": "Qualified",            # "Qualified" in the Havana dashboard
+    "not_interested": "Closed - Not Interested",
+    "bounced": "Closed - Bad Contact Info",
+    "unresponsive": "Closed - Unresponsive",
+    "unsubscribed": "Do Not Contact",     # compliance: suppress outreach
+    "needs_human_review": "Needs Review",
+    "intentionally_stopped": "On Hold",
+}
+
+OVERLAP = timedelta(minutes=5)
+
+
+def upsert_into_crm(lead: dict) -> None:
+    """Idempotent write into your CRM, matched on external_id."""
+    crm.upsert(
+        match_on={"Id": lead["external_id"]},
+        fields={
+            # .get() fallback: new statuses may be added without a version
+            # bump, so never hard-key on the status enum
+            "Havana_Status__c": STATUS_TO_STAGE.get(lead["status"], "Needs Review"),
+            "Havana_Intent__c": lead["intent"],          # null until classified
+            "Havana_Unsubscribed__c": lead["unsubscribed"],
+            "Havana_Calls__c": lead["counts"]["calls"],
+            "Havana_Calls_Answered__c": lead["counts"]["calls_answered"],
+            "Havana_Last_Synced__c": lead["updated_at"],
+        },
+    )
+
+
+def run_daily_sync(state: dict) -> None:
+    params = {"limit": 100}
+    if state.get("updated_since"):           # omit on first run = full backfill
+        params["updated_since"] = state["updated_since"]
+
+    last_updated_at = None
+    while True:
+        resp = requests.get(f"{API_BASE}/api/v1/leads", headers=HEADERS, params=params)
+        if resp.status_code == 429:          # respect rate limits
+            time.sleep(int(resp.headers.get("Retry-After", 30)))
+            continue
+        resp.raise_for_status()
+        page = resp.json()
+
+        for lead in page["data"]:
+            if lead["external_id"] is None:  # no CRM reference — your policy here
+                continue
+            upsert_into_crm(lead)
+            last_updated_at = lead["updated_at"]
+
+        if page["next_cursor"] is None:      # end of the result set
+            break
+        params["cursor"] = page["next_cursor"]
+
+    # Watermark = last processed updated_at minus an overlap window.
+    # Re-fetching boundary leads is safe because upserts are idempotent.
+    if last_updated_at:
+        cutoff = datetime.fromisoformat(last_updated_at.replace("Z", "+00:00")) - OVERLAP
+        state["updated_since"] = cutoff.strftime("%Y-%m-%dT%H:%M:%SZ")
+```
+
+Want richer data per lead? From inside the loop you can pull `GET /api/v1/leads/{external_id}/activities` for the per-engagement log, `/thread` for the full interleaved transcript, or `/appointments` for booked times — all keyed on the same `external_id`.
+
+## Idempotency
+
+The entire design assumes **re-processing is free**:
+
+- The same lead appears in multiple polls by design — every classification, status change, or new engagement bumps `updated_at` and re-surfaces it.
+- The watermark overlap window re-fetches boundary leads on purpose, so a sync that crashes mid-run can simply be re-run from the previous watermark.
+- Each poll returns the lead's *current* state, so upserting the same payload twice converges on the same CRM record.
+
+Concretely: match on `external_id`, overwrite fields rather than appending, and never use insert-only writes. If your CRM write path can't tolerate replays, fix that before tuning anything else.
+
+## Common mistakes
+
+<Warning>
+**Filtering on `created_at` instead of `updated_at`.** `created_at` is when the lead entered Havana and never changes — a `created_at` filter only ever shows you *new* leads and silently drops every status change, engagement, and late classification on existing ones. `updated_at` is the delta-sync key: it moves every time anything about the lead changes, including classifications that land hours after the call. If your synced intents are permanently `null`, this is almost always why.
+</Warning>
+
+<Warning>
+**Treating webhook payloads as the source of truth.** Webhook events are deliberately thin — event type, IDs, a per-lead `sequence` number, and `occurred_at`. They never carry full resource state, deliveries are at-least-once and can arrive out of order, and `call.completed` always arrives with `classification_status: pending` and `intent: null`. Writing webhook fields directly into your CRM means writing stale, partial state. The correct pattern: on receiving a webhook, fetch the referenced resource (`GET /api/v1/leads/{external_id}` or `GET /api/v1/calls/{id}`) — or just let your next daily poll carry the same state.
+</Warning>
+
+A few smaller ones worth checking:
+
+- **Using `intent` as the pipeline driver.** `status` is the lifecycle field; `intent` is the per-classification detail. Map `status` to stages and store `intent` as supporting context.
+- **Persisting the watermark before the run finishes.** Update `updated_since` only after the final page; otherwise a mid-run crash skips leads.
+- **Dropping `is_test` leads late.** If you don't want Havana test leads in your CRM, filter on `is_test` at upsert time.
+
+## Next steps
+
+- Add the `lead.unsubscribed` and `handoff.requested` webhooks as accelerators for the two genuinely time-sensitive moments — DNC compliance and "a rep should call now" — while the daily poll remains your system of record.
+- Pull `GET /api/v1/leads/{external_id}/thread` to render the full cross-channel conversation in your CRM's activity timeline.
+- See the [API reference](/api-reference/openapi.yaml) for every field, enum, and error shape.
