@@ -3,7 +3,7 @@ title: "Introduction"
 description: "Write Havana engagement data back into your own CRM — any CRM"
 ---
 
-The Havana Public API is a **CRM-agnostic, read-only API plus thin webhooks** for writing Havana engagement data back into your own CRM. Havana works your leads across voice, SMS, WhatsApp, and email; this API is how the results — statuses, classified intents, transcripts, appointments, opt-outs — land back in the system your team already lives in.
+The Havana Public API is a **CRM-agnostic read API plus thin webhooks** for writing Havana engagement data back into your own CRM, plus a **campaign-scoped upload endpoint** for pushing new leads into Havana. Havana works your leads across voice, SMS, WhatsApp, and email; this API is how leads flow in and how the results — statuses, classified intents, transcripts, appointments, opt-outs — land back in the system your team already lives in.
 
 Every record and every webhook event carries `external_id`: the record ID *your* CRM assigned to the lead, captured when the lead was imported into Havana. You never need to map Havana IDs to your own — upsert on `external_id` and you are done.
 
@@ -31,9 +31,9 @@ Havana classifies engagements (calls, messages, emails) asynchronously. Every cl
 
 ## What's in v1
 
-The v1 surface is read-only plus webhooks:
+Reads, webhooks, and campaign-scoped lead upload:
 
-| Endpoint | What it returns |
+| Endpoint | What it does |
 | --- | --- |
 | `GET /api/v1/leads` | Delta-sync lead list (`updated_since` + cursor) |
 | `GET /api/v1/leads/{external_id}` | Single lead: status, latest intent, engagement counts |
@@ -41,6 +41,8 @@ The v1 surface is read-only plus webhooks:
 | `GET /api/v1/leads/{external_id}/thread` | Full interleaved transcript across all channels |
 | `GET /api/v1/calls/{id}` | Call detail: transcript, recording URL, intent, transfer outcome |
 | `GET /api/v1/leads/{external_id}/appointments` | Appointments booked for the lead |
+| `GET /api/v1/campaigns` | Campaign discovery — find the campaign to upload into |
+| `POST /api/v1/campaigns/{campaign_id}/leads` | Upload up to 500 leads into a campaign (upsert + enroll) |
 
 Webhook events: `lead.status_changed`, `lead.classified`, `call.completed`, `lead.unsubscribed`, `handoff.requested`.
 
@@ -60,6 +62,9 @@ Webhook events: `lead.status_changed`, `lead.classified`, `call.completed`, `lea
   </Card>
   <Card title="Daily CRM sync" icon="rotate" href="/guides/daily-crm-sync">
     Build the delta-poll loop that writes Havana data back into your CRM.
+  </Card>
+  <Card title="Uploading leads" icon="upload" href="/guides/uploading-leads">
+    Push new leads into a campaign with batch upsert and per-row results.
   </Card>
   <Card title="Webhooks" icon="bolt" href="/guides/webhooks">
     Subscribe to thin events, verify signatures, and handle retries.

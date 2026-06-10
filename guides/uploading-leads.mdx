@@ -1,0 +1,125 @@
+---
+title: "Uploading leads"
+sidebarTitle: "Uploading leads"
+description: "Push new leads into a Havana campaign with batch upsert and per-row results"
+icon: "upload"
+---
+
+Leads are uploaded **into a campaign** — the campaign defines the schedule, channels, scripts, and rules under which the lead is worked, so the campaign ID is part of the URL:
+
+```text
+POST /api/v1/campaigns/{campaign_id}/leads
+```
+
+Each request carries up to **500 leads** and returns synchronously with a per-row result for every one of them.
+
+## 1. Find your campaign ID
+
+Campaign IDs are stable — look the ID up once and keep it in your integration's configuration:
+
+```bash
+curl https://api.usehavana.com/api/v1/campaigns \
+  -H "Authorization: Bearer hav_your_key"
+```
+
+```json
+{
+  "data": [
+    {
+      "id": "cam20260301zq8w4e7r2t9yu",
+      "name": "RN-to-BSN Spring Re-engagement",
+      "enabled": true,
+      "created_at": "2026-03-01T09:12:00Z"
+    }
+  ],
+  "next_cursor": null,
+  "has_more": false
+}
+```
+
+<Note>
+  Leads can be uploaded into a disabled campaign — they sit enrolled and
+  outreach begins if/when the campaign is enabled.
+</Note>
+
+## 2. Upload a batch
+
+```bash
+curl -X POST https://api.usehavana.com/api/v1/campaigns/cam20260301zq8w4e7r2t9yu/leads \
+  -H "Authorization: Bearer hav_your_key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "leads": [
+      {
+        "external_id": "00Q5f000001NewLdEAV",
+        "email": "jordan.lee@example.com",
+        "phone_number": "+13125550199",
+        "first_name": "Jordan",
+        "last_name": "Lee",
+        "state": "IL",
+        "assigned_rep_email": "avery.brown@university.edu",
+        "params": {
+          "program_of_interest": "BSN Online",
+          "inquiry_date": "2026-06-09"
+        }
+      }
+    ]
+  }'
+```
+
+Field rules:
+
+- `external_id` is **required** — it is the upsert key and the ID every Havana record and webhook event echoes back, so your CRM never needs to store Havana IDs.
+- At least one of `email` or `phone_number` is required, so the campaign has a channel to reach the lead on. Phone numbers are E.164 (`+13125550199`).
+- `state` drives timezone resolution and calling-window compliance (it takes precedence over the phone number's area code). Pass it when you have it.
+- `params` is a free-form object for custom fields — values become template variables in campaign content (e.g. `program_of_interest`).
+
+## 3. Read the per-row results
+
+The HTTP call returns `200` even when individual rows fail — **always check `summary.failed`**:
+
+```json
+{
+  "summary": { "received": 2, "created": 1, "updated": 0, "already_in_campaign": 0, "failed": 1 },
+  "results": [
+    {
+      "external_id": "00Q5f000001NewLdEAV",
+      "status": "created",
+      "lead_id": "led20260610zn3w8k5mq2x7c",
+      "error": null
+    },
+    {
+      "external_id": "00Q5f000001OldLdEAV",
+      "status": "failed",
+      "lead_id": null,
+      "error": {
+        "code": "missing_rep",
+        "message": "assigned_rep_email is required by this campaign and no default rep is configured."
+      }
+    }
+  ]
+}
+```
+
+| Row status | Meaning |
+| --- | --- |
+| `created` | New lead created and enrolled in the campaign |
+| `updated` | Existing lead (matched on `external_id`) updated and enrolled |
+| `already_in_campaign` | Lead exists and was already enrolled — its campaign progression is untouched |
+| `failed` | Row rejected — see `error.code` |
+
+Failure codes: `missing_identifier` (no email or phone), `missing_field`, `missing_rep`, `invalid_phone_number`, `invalid_email`, `external_id_mismatch`. Failed rows never block the rest of the batch — fix and resend just the failures.
+
+## Semantics worth knowing
+
+**Upsert, never duplicate.** Rows match on `external_id` within your team. Non-null payload fields overwrite stored values; `params` keys are merged. Re-uploading a lead never creates a duplicate and never restarts a campaign's outreach from the beginning.
+
+**Enrollment is not instant outreach.** Upload places the lead in the campaign; first contact happens when the campaign engine picks it up, subject to the campaign's schedule, sending windows, and rate caps. Don't expect a call or message the second the API returns.
+
+**Unsubscribes are permanent.** A lead that previously opted out stays opted out. Re-uploading it updates fields and returns `updated`, but does not re-enable outreach — there is deliberately no way to resubscribe a lead through this API.
+
+**Retries are safe.** The operation is idempotent per row: resending a batch after a timeout or network error yields `updated` / `already_in_campaign` rather than duplicates.
+
+## Closing the loop
+
+Uploaded leads flow back through the same read surface as everything else: they appear in your [daily delta poll](/guides/daily-crm-sync) as their `updated_at` changes, their engagement shows up under `/activities` and `/thread`, and time-sensitive moments (qualified, opted out, wants a human) arrive as [webhook events](/guides/webhooks). Upload is the only write you need — everything after it is the standard write-back loop.

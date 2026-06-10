@@ -21,6 +21,7 @@
         "group": "Guides",
         "pages": [
           "guides/daily-crm-sync",
+          "guides/uploading-leads",
           "guides/webhooks",
           "guides/statuses-and-intents"
         ]

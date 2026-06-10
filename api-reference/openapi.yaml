@@ -4,8 +4,9 @@ info:
   title: Havana Public API
   version: 1.0.0-draft
   description: |
-    Havana's CRM-agnostic public API: a read-only surface plus thin webhooks
-    that lets you write Havana engagement data back into your own CRM.
+    Havana's CRM-agnostic public API: a read surface plus thin webhooks for
+    writing Havana engagement data back into your own CRM, and a
+    campaign-scoped upload endpoint for pushing new leads into Havana.
 
     ## The daily write-back model
 
@@ -72,6 +73,11 @@ tags:
       Lead records and their engagement timelines. The delta-sync list endpoint
       is the backbone of the integration; detail endpoints expose status,
       counts, activities, and the full interleaved engagement thread.
+  - name: Campaigns
+    description: >-
+      Campaign discovery and campaign-scoped lead upload. Campaigns are the
+      unit of outreach configuration; leads are uploaded into a specific
+      campaign and worked according to that campaign's schedule and rules.
   - name: Calls
     description: >-
       Voice call detail: transcript, recording, duration, classification,
@@ -587,6 +593,163 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '404':
           $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /api/v1/campaigns:
+    get:
+      operationId: listCampaigns
+      tags: [Campaigns]
+      summary: List campaigns
+      description: >-
+        Returns the team's campaigns, newest first. Use this to discover the
+        `campaign_id` to upload leads into — campaign IDs are stable, so most
+        integrations look the ID up once and store it in configuration rather
+        than calling this per upload.
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: A page of the team's campaigns.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedCampaigns'
+              example:
+                data:
+                  - id: cam20260301zq8w4e7r2t9yu
+                    name: RN-to-BSN Spring Re-engagement
+                    enabled: true
+                    created_at: '2026-03-01T09:12:00Z'
+                  - id: cam20260418zbsno5x1c3vpn
+                    name: BSN Online Aged Leads
+                    enabled: false
+                    created_at: '2026-04-18T14:03:22Z'
+                next_cursor: null
+                has_more: false
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /api/v1/campaigns/{campaign_id}/leads:
+    post:
+      operationId: uploadLeads
+      tags: [Campaigns]
+      summary: Upload leads into a campaign
+      description: |
+        Uploads a batch of up to 500 leads into the campaign, creating or
+        updating each lead and enrolling it so the campaign starts working it.
+        The call is synchronous: the response carries a per-row result for
+        every submitted lead.
+
+        **Upsert semantics.** Rows are matched on `external_id` within your
+        team. A new `external_id` creates a lead (`created`); an existing one
+        updates it (`updated`) — non-null fields in the payload overwrite the
+        stored values, and `params` keys are merged. A lead already enrolled
+        in this campaign returns `already_in_campaign` and is left where it is
+        in the campaign's progression (re-uploading never restarts outreach).
+
+        **Enrollment is not instant outreach.** Upload places the lead into
+        the campaign; first contact happens when the campaign engine picks the
+        lead up, subject to the campaign's schedule, sending windows, and
+        rate caps.
+
+        **Compliance.** A lead that previously unsubscribed stays
+        unsubscribed: uploading it again updates fields and returns `updated`,
+        but does not re-enable outreach.
+
+        **Retries.** The operation is idempotent per row — retrying a failed
+        request re-yields `updated`/`already_in_campaign` rather than
+        duplicates, so it is always safe to resend a batch after a network
+        error.
+      parameters:
+        - name: campaign_id
+          in: path
+          required: true
+          description: Havana campaign ID (see `GET /api/v1/campaigns`).
+          schema:
+            type: string
+          example: cam20260301zq8w4e7r2t9yu
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LeadUploadRequest'
+            example:
+              leads:
+                - external_id: 00Q5f000001NewLdEAV
+                  email: jordan.lee@example.com
+                  phone_number: '+13125550199'
+                  first_name: Jordan
+                  last_name: Lee
+                  state: IL
+                  assigned_rep_email: avery.brown@university.edu
+                  params:
+                    program_of_interest: BSN Online
+                    inquiry_date: '2026-06-09'
+                - external_id: 00Q5f000001OldLdEAV
+                  phone_number: '+16085550112'
+                  first_name: Sam
+                  last_name: Okafor
+      responses:
+        '200':
+          description: >-
+            Per-row results for the batch. The request as a whole succeeds
+            even when individual rows fail — always check `summary.failed`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LeadUploadResponse'
+              example:
+                summary:
+                  received: 2
+                  created: 1
+                  updated: 0
+                  already_in_campaign: 0
+                  failed: 1
+                results:
+                  - external_id: 00Q5f000001NewLdEAV
+                    status: created
+                    lead_id: led20260610zn3w8k5mq2x7c
+                    error: null
+                  - external_id: 00Q5f000001OldLdEAV
+                    status: failed
+                    lead_id: null
+                    error:
+                      code: missing_rep
+                      message: >-
+                        assigned_rep_email is required by this campaign and no
+                        default rep is configured.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: No campaign with this ID exists for the authenticated team.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                code: not_found
+                message: No campaign found with id cam20260301zq8w4e7r2t9yu.
+                detail:
+                  parameter: campaign_id
+        '422':
+          description: >-
+            Request body is structurally invalid — malformed JSON, an empty
+            `leads` array, or more than 500 rows. No rows are processed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                code: invalid_request
+                message: leads exceeds the maximum batch size of 500.
+                detail:
+                  parameter: leads
+                  max_items: 500
         '429':
           $ref: '#/components/responses/RateLimited'
 
@@ -2318,3 +2481,241 @@ components:
                 Whether the completed call was a scheduled callback, for
                 `call.completed` events. Null otherwise.
               example: false
+
+    Campaign:
+      type: object
+      description: >-
+        An outreach campaign. Campaigns own the schedule, channels, scripts,
+        and rules under which their enrolled leads are worked.
+      required:
+        - id
+        - name
+        - enabled
+        - created_at
+      properties:
+        id:
+          type: string
+          description: Havana campaign ID. Stable; safe to store in integration config.
+          example: cam20260301zq8w4e7r2t9yu
+        name:
+          type: string
+          description: Human-readable campaign name as shown in the dashboard.
+          example: RN-to-BSN Spring Re-engagement
+        enabled:
+          type: boolean
+          description: >-
+            Whether the campaign is currently running. Leads can be uploaded
+            into a disabled campaign; outreach starts if/when it is enabled.
+          example: true
+        created_at:
+          type: string
+          format: date-time
+          description: When the campaign was created.
+          example: '2026-03-01T09:12:00Z'
+
+    PaginatedCampaigns:
+      type: object
+      description: >-
+        Cursor-paginated page of campaigns. Pass `next_cursor` back as the
+        `cursor` query parameter to fetch the next page; a null `next_cursor`
+        means you have reached the end of the result set.
+      required:
+        - data
+        - next_cursor
+      properties:
+        data:
+          type: array
+          description: Campaigns in this page, newest first.
+          items:
+            $ref: '#/components/schemas/Campaign'
+        next_cursor:
+          type: ['string', 'null']
+          description: Opaque cursor for the next page. Null when no further results exist.
+          example: null
+        has_more:
+          type: boolean
+          description: True when more results are available beyond this page.
+          example: false
+
+    LeadUploadItem:
+      type: object
+      description: >-
+        One lead to create or update and enroll in the campaign. `external_id`
+        is the upsert key; at least one of `email` or `phone_number` must be
+        present so the campaign has a channel to reach the lead on.
+      required:
+        - external_id
+      anyOf:
+        - required: [email]
+        - required: [phone_number]
+      properties:
+        external_id:
+          type: string
+          description: >-
+            Your CRM record ID for this lead (e.g. a Salesforce Lead Id). Used
+            as the upsert key and echoed back on every record and webhook
+            event, so you never need to store Havana IDs.
+          example: 00Q5f000001NewLdEAV
+        email:
+          type: ['string', 'null']
+          format: email
+          description: Lead's email address.
+          example: jordan.lee@example.com
+        phone_number:
+          type: ['string', 'null']
+          description: Lead's phone number in E.164 format.
+          example: '+13125550199'
+        first_name:
+          type: ['string', 'null']
+          description: Lead's first name.
+          example: Jordan
+        last_name:
+          type: ['string', 'null']
+          description: Lead's last name.
+          example: Lee
+        state:
+          type: ['string', 'null']
+          description: >-
+            US state (two-letter code or full name). Used for timezone
+            resolution and calling-window compliance; takes precedence over
+            the phone number's area code.
+          example: IL
+        time_zone:
+          type: ['string', 'null']
+          description: >-
+            IANA timezone (e.g. `America/Chicago`). Rarely needed — when
+            omitted, Havana resolves the timezone from `state`, then from the
+            phone number.
+          example: null
+        assigned_rep_email:
+          type: ['string', 'null']
+          description: >-
+            Email of the rep this lead belongs to. Required by campaigns whose
+            messaging sends on behalf of an assigned rep; omit to use the
+            campaign's default rep when one is configured.
+          example: avery.brown@university.edu
+        params:
+          type: object
+          additionalProperties: true
+          description: >-
+            Custom fields, merged key-by-key into the lead's stored params.
+            Available as template variables in campaign content (e.g.
+            `program_of_interest`).
+          example:
+            program_of_interest: BSN Online
+            inquiry_date: '2026-06-09'
+
+    LeadUploadRequest:
+      type: object
+      description: Batch of leads to upload into the campaign.
+      required:
+        - leads
+      properties:
+        leads:
+          type: array
+          minItems: 1
+          maxItems: 500
+          description: Leads to create or update and enroll. Maximum 500 per request.
+          items:
+            $ref: '#/components/schemas/LeadUploadItem'
+
+    LeadUploadResult:
+      type: object
+      description: Outcome for one submitted lead row.
+      required:
+        - external_id
+        - status
+        - lead_id
+        - error
+      properties:
+        external_id:
+          type: string
+          description: The `external_id` of the submitted row this result refers to.
+          example: 00Q5f000001NewLdEAV
+        status:
+          type: string
+          enum:
+            - created
+            - updated
+            - already_in_campaign
+            - failed
+          description: >-
+            `created` — new lead created and enrolled. `updated` — existing
+            lead updated and enrolled (or re-confirmed). `already_in_campaign`
+            — lead exists and was already enrolled; nothing changed in its
+            campaign progression. `failed` — row rejected; see `error`.
+          example: created
+        lead_id:
+          type: ['string', 'null']
+          description: Havana lead ID for successful rows. Null on failure.
+          example: led20260610zn3w8k5mq2x7c
+        error:
+          description: Failure detail for `failed` rows; null otherwise.
+          anyOf:
+            - type: 'null'
+            - type: object
+              required: [code, message]
+              properties:
+                code:
+                  type: string
+                  enum:
+                    - missing_identifier
+                    - missing_field
+                    - missing_rep
+                    - invalid_phone_number
+                    - invalid_email
+                    - external_id_mismatch
+                  description: >-
+                    `missing_identifier` — neither email nor phone_number
+                    present. `missing_field` — a field this campaign requires
+                    is absent. `missing_rep` — campaign requires a rep and
+                    none was given or defaulted. `invalid_phone_number` /
+                    `invalid_email` — value failed validation.
+                    `external_id_mismatch` — external_id collides with a
+                    different record type already linked to this lead.
+                  example: missing_rep
+                message:
+                  type: string
+                  description: Human-readable explanation of the failure.
+                  example: assigned_rep_email is required by this campaign.
+
+    LeadUploadResponse:
+      type: object
+      description: >-
+        Per-row results for an upload batch. The HTTP call succeeds (200) even
+        when individual rows fail — inspect `summary.failed` and the `results`
+        array.
+      required:
+        - summary
+        - results
+      properties:
+        summary:
+          type: object
+          description: Row counts by outcome for the whole batch.
+          required: [received, created, updated, already_in_campaign, failed]
+          properties:
+            received:
+              type: integer
+              description: Total rows submitted.
+              example: 2
+            created:
+              type: integer
+              description: Rows that created a new lead.
+              example: 1
+            updated:
+              type: integer
+              description: Rows that updated an existing lead.
+              example: 0
+            already_in_campaign:
+              type: integer
+              description: Rows whose lead was already enrolled in this campaign.
+              example: 0
+            failed:
+              type: integer
+              description: Rows rejected with an error.
+              example: 1
+        results:
+          type: array
+          description: One result per submitted row, in submission order.
+          items:
+            $ref: '#/components/schemas/LeadUploadResult'
