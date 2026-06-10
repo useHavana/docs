@@ -58,7 +58,7 @@ curl -X POST https://api.usehavana.com/api/v1/campaigns/cam20260301zq8w4e7r2t9yu
         "last_name": "Lee",
         "state": "IL",
         "assigned_rep_email": "avery.brown@university.edu",
-        "params": {
+        "custom_attributes": {
           "program_of_interest": "BSN Online",
           "inquiry_date": "2026-06-09"
         }
@@ -72,7 +72,7 @@ Field rules:
 - `external_id` is **required** — it is the upsert key and the ID every Havana record and webhook event echoes back, so your CRM never needs to store Havana IDs.
 - At least one of `email` or `phone_number` is required, so the campaign has a channel to reach the lead on. Phone numbers are E.164 (`+13125550199`).
 - `state` drives timezone resolution and calling-window compliance (it takes precedence over the phone number's area code). Pass it when you have it.
-- `params` is a free-form object for custom fields — values become template variables in campaign content (e.g. `program_of_interest`).
+- `custom_attributes` is a free-form object for custom fields — values become template variables in campaign content (e.g. `program_of_interest`).
 
 ## 3. Read the per-row results
 
@@ -112,7 +112,7 @@ Failure codes: `missing_identifier` (no email or phone), `missing_field`, `missi
 
 ## Semantics worth knowing
 
-**Upsert, never duplicate.** Rows match on `external_id` within your team. Non-null payload fields overwrite stored values; `params` keys are merged. Re-uploading a lead never creates a duplicate and never restarts a campaign's outreach from the beginning.
+**Upsert, never duplicate.** Rows match on `external_id` within your team. Non-null payload fields overwrite stored values; `custom_attributes` keys are merged. Re-uploading a lead never creates a duplicate and never restarts a campaign's outreach from the beginning.
 
 **Enrollment is not instant outreach.** Upload places the lead in the campaign; first contact happens when the campaign engine picks it up, subject to the campaign's schedule, sending windows, and rate caps. Don't expect a call or message the second the API returns.
 

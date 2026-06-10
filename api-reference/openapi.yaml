@@ -647,7 +647,7 @@ paths:
         **Upsert semantics.** Rows are matched on `external_id` within your
         team. A new `external_id` creates a lead (`created`); an existing one
         updates it (`updated`) — non-null fields in the payload overwrite the
-        stored values, and `params` keys are merged. A lead already enrolled
+        stored values, and `custom_attributes` keys are merged. A lead already enrolled
         in this campaign returns `already_in_campaign` and is left where it is
         in the campaign's progression (re-uploading never restarts outreach).
 
@@ -687,7 +687,7 @@ paths:
                   last_name: Lee
                   state: IL
                   assigned_rep_email: avery.brown@university.edu
-                  params:
+                  custom_attributes:
                     program_of_interest: BSN Online
                     inquiry_date: '2026-06-09'
                 - external_id: 00Q5f000001OldLdEAV
@@ -2594,13 +2594,13 @@ components:
             messaging sends on behalf of an assigned rep; omit to use the
             campaign's default rep when one is configured.
           example: avery.brown@university.edu
-        params:
+        custom_attributes:
           type: object
           additionalProperties: true
           description: >-
-            Custom fields, merged key-by-key into the lead's stored params.
-            Available as template variables in campaign content (e.g.
-            `program_of_interest`).
+            Custom fields, merged key-by-key into the lead's stored custom
+            attributes. Available as template variables in campaign content
+            (e.g. `program_of_interest`).
           example:
             program_of_interest: BSN Online
             inquiry_date: '2026-06-09'
