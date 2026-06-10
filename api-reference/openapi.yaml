@@ -1,0 +1,2320 @@
+openapi: 3.1.0
+
+info:
+  title: Havana Public API
+  version: 1.0.0-draft
+  description: |
+    Havana's CRM-agnostic public API: a read-only surface plus thin webhooks
+    that lets you write Havana engagement data back into your own CRM.
+
+    ## The daily write-back model
+
+    The primary integration pattern is a **daily delta poll**:
+
+    1. Call `GET /api/v1/leads?updated_since=<last poll>` and page through the
+       results with `cursor`.
+    2. Upsert each lead into your CRM keyed on `external_id` — the record ID
+       *your* CRM assigned, which Havana captured at import time and returns on
+       every record and event.
+    3. Persist the `updated_at` of the last record you processed (minus a small
+       overlap window) as the next poll's `updated_since`.
+
+    **Pull is the backbone; webhooks are accelerators.** Webhook events are
+    thin — event type, IDs, a per-lead monotonic sequence number, and
+    `occurred_at` — and never carry full resource state. On receipt, fetch the
+    referenced resource (or just run your delta poll) to get the source of
+    truth. A missed webhook is never data loss: your next `updated_since` poll
+    carries the same state.
+
+    ## Asynchronous classification
+
+    Havana classifies engagements (calls, messages, emails) **asynchronously**.
+    Every classifiable record carries a `classification_status` of `pending` or
+    `completed` and a nullable `intent`:
+
+    * The `call.completed` webhook fires immediately when a call ends, with
+      `classification_status: pending` and `intent: null`.
+    * A `lead.classified` event follows once the classifier lands — typically
+      within minutes.
+    * Late classifications **bump the lead's `updated_at`**, so the lead
+      reappears in your next `updated_since` poll and the re-poll catches the
+      final intent. Always upsert: the same lead can (and will) appear in
+      multiple polls.
+
+    ## Conventions
+
+    * All endpoints live under the `/api/v1` path prefix.
+    * Authenticate with a per-team API key: `Authorization: Bearer hav_...`.
+    * Every list endpoint uses cursor pagination: pass `cursor` and `limit`,
+      read `next_cursor` from the response (`null` means the end).
+    * Every non-2xx response uses a single error envelope:
+      `{code, message, detail}`.
+    * Webhook payloads are signed with HMAC-SHA256, delivered in the
+      `X-Havana-Signature` header. Verify before trusting the payload.
+  license:
+    name: Proprietary
+    url: https://www.usehavana.com/terms
+  contact:
+    name: Havana Support
+    email: support@usehavana.com
+    url: https://www.usehavana.com
+
+servers:
+  - url: https://api.usehavana.com
+    description: Production
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: Leads
+    description: >-
+      Lead records and their engagement timelines. The delta-sync list endpoint
+      is the backbone of the integration; detail endpoints expose status,
+      counts, activities, and the full interleaved engagement thread.
+  - name: Calls
+    description: >-
+      Voice call detail: transcript, recording, duration, classification,
+      callback flag, and transfer outcome.
+  - name: Appointments
+    description: >-
+      Appointments booked for a lead during calls, messaging conversations, or
+      through a booking page.
+  - name: Webhooks
+    description: >-
+      Thin event notifications delivered to your endpoint. Events carry IDs and
+      a per-lead monotonic sequence number — not full resource state. The pull
+      API is the source of truth.
+
+paths:
+  /api/v1/leads:
+    get:
+      operationId: listLeads
+      tags: [Leads]
+      summary: List leads (delta sync)
+      description: |
+        Returns the team's leads ordered by `updated_at` ascending, filtered by
+        `updated_since`. This endpoint is the backbone of the integration:
+        customers poll it (typically daily) to write lead data back into their
+        own CRM.
+
+        **Delta sync semantics.** Any change to a lead bumps its `updated_at`,
+        including *late-arriving classifications*: classification is
+        asynchronous, so a call may complete (and the lead surface in one poll)
+        before its intent is classified. When the classifier lands, the lead's
+        `updated_at` is bumped again, so the lead reappears in your next
+        `updated_since` poll and the re-poll catches the final classification.
+        Always upsert on `external_id` — the same lead can (and will) appear in
+        multiple polls.
+
+        Recommended pattern: persist the `updated_at` of the last record you
+        processed and use it (minus a small overlap window, e.g. 5 minutes) as
+        the next poll's `updated_since`. Use `cursor` to page through large
+        result sets within a single poll.
+      parameters:
+        - name: updated_since
+          in: query
+          required: false
+          description: >-
+            Only return leads whose `updated_at` is at or after this RFC 3339
+            timestamp. Omit to page through the full lead set (initial
+            backfill).
+          schema:
+            type: string
+            format: date-time
+          example: '2026-06-09T00:00:00Z'
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: A page of leads updated since the requested timestamp.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedLeads'
+              example:
+                data:
+                  - id: led20260512zr7k2m4xq9p3v
+                    external_id: 00Q5f000001AbCdEAV
+                    status: interested
+                    intent: voice_interested_with_booked_time
+                    first_name: Maria
+                    last_name: Santos
+                    email: maria.santos@example.com
+                    phone_number: '+13125550148'
+                    import_source: salesforce
+                    external_status: Working - Contacted
+                    external_synced_at: '2026-06-09T14:02:11Z'
+                    time_zone: America/Chicago
+                    state: IL
+                    unsubscribed: false
+                    bounced: false
+                    invalid_number: false
+                    is_inbound: false
+                    is_test: false
+                    custom_fields:
+                      inquiry_age_c: '14'
+                      program_of_interest: RN-to-BSN
+                    counts:
+                      calls: 4
+                      calls_answered: 1
+                      emails_sent: 3
+                      emails_received: 1
+                      email_opens: 5
+                      messages_sent: 2
+                      messages_received: 1
+                    created_at: '2026-05-12T09:30:00Z'
+                    updated_at: '2026-06-09T18:45:31Z'
+                  - id: led20260602zb8n3k7w1q5fd
+                    external_id: 00Q5f000001XyZwEAV
+                    status: contacted
+                    intent: null
+                    first_name: Devon
+                    last_name: Carter
+                    email: devon.carter@example.com
+                    phone_number: '+16145550722'
+                    import_source: salesforce
+                    external_status: null
+                    external_synced_at: null
+                    time_zone: America/New_York
+                    state: OH
+                    unsubscribed: false
+                    bounced: false
+                    invalid_number: false
+                    is_inbound: false
+                    is_test: false
+                    custom_fields:
+                      program_of_interest: BSN Online
+                    counts:
+                      calls: 1
+                      calls_answered: 0
+                      emails_sent: 1
+                      emails_received: 0
+                      email_opens: 0
+                      messages_sent: 2
+                      messages_received: 0
+                    created_at: '2026-06-02T11:30:45Z'
+                    updated_at: '2026-06-09T19:01:38Z'
+                next_cursor: eyJ1cGRhdGVkX2F0IjoiMjAyNi0wNi0wOVQxOTowMTozOFoifQ
+                has_more: true
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /api/v1/leads/{external_id}:
+    get:
+      operationId: getLead
+      tags: [Leads]
+      summary: Get a lead
+      description: |
+        Returns a single lead by `external_id` — the record ID of the lead in
+        *your* CRM, supplied when the lead was created in Havana. The response
+        includes the lead's current status, latest classified intent, and
+        engagement counts.
+
+        This is the source of truth for a lead's current state. Webhook events
+        are thin notifications; after receiving one, fetch this endpoint to get
+        the full, current record.
+      parameters:
+        - $ref: '#/components/parameters/ExternalId'
+      responses:
+        '200':
+          description: The lead.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Lead'
+              example:
+                id: led20260512zr7k2m4xq9p3v
+                external_id: 00Q5f000001AbCdEAV
+                status: interested
+                intent: voice_interested_with_booked_time
+                first_name: Maria
+                last_name: Santos
+                email: maria.santos@example.com
+                phone_number: '+13125550148'
+                import_source: salesforce
+                external_status: Working - Contacted
+                external_synced_at: '2026-06-09T14:02:11Z'
+                time_zone: America/Chicago
+                state: IL
+                unsubscribed: false
+                bounced: false
+                invalid_number: false
+                is_inbound: false
+                is_test: false
+                custom_fields:
+                  inquiry_age_c: '14'
+                  program_of_interest: RN-to-BSN
+                counts:
+                  calls: 4
+                  calls_answered: 1
+                  emails_sent: 3
+                  emails_received: 1
+                  email_opens: 5
+                  messages_sent: 2
+                  messages_received: 1
+                created_at: '2026-05-12T09:30:00Z'
+                updated_at: '2026-06-09T18:45:31Z'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /api/v1/leads/{external_id}/activities:
+    get:
+      operationId: listLeadActivities
+      tags: [Leads]
+      summary: List a lead's activities
+      description: |
+        Returns the lead's activity log: calls, messages (SMS/WhatsApp),
+        emails, and status transitions, newest first.
+
+        **Classification is asynchronous.** Every call, message, and email row
+        carries a `classification_status` of `pending` or `completed` and a
+        nullable `intent`. A `call.completed` webhook fires immediately with
+        the activity still `pending`; when the classifier lands, the row flips
+        to `completed`, `intent` is populated, and the parent lead's
+        `updated_at` is bumped so delta polls pick up the change. Do not treat
+        `pending` rows as final.
+      parameters:
+        - $ref: '#/components/parameters/ExternalId'
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: A page of the lead's activities, newest first.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedActivities'
+              example:
+                data:
+                  - id: act20260609zq8w3e7r2t9yu
+                    lead_id: led20260512zr7k2m4xq9p3v
+                    external_id: 00Q5f000001AbCdEAV
+                    type: call
+                    channel: voice
+                    direction: outbound
+                    occurred_at: '2026-06-09T14:21:47Z'
+                    classification_status: pending
+                    intent: null
+                    summary: null
+                    call_id: vca20260609z8h3n6tq2w5dy
+                    message_id: null
+                    email_id: null
+                    from_status: null
+                    to_status: null
+                  - id: act20260608zw3v7n1k9j5hg
+                    lead_id: led20260512zr7k2m4xq9p3v
+                    external_id: 00Q5f000001AbCdEAV
+                    type: status_change
+                    channel: system
+                    direction: null
+                    occurred_at: '2026-06-08T19:06:02Z'
+                    classification_status: completed
+                    intent: null
+                    summary: Status changed from replied to interested.
+                    call_id: null
+                    message_id: null
+                    email_id: null
+                    from_status: replied
+                    to_status: interested
+                  - id: act20260608zt5y8u2i6o1pa
+                    lead_id: led20260512zr7k2m4xq9p3v
+                    external_id: 00Q5f000001AbCdEAV
+                    type: message
+                    channel: sms
+                    direction: inbound
+                    occurred_at: '2026-06-08T19:05:12Z'
+                    classification_status: completed
+                    intent: messaging_interested
+                    summary: Lead asked about tuition and confirmed interest.
+                    call_id: null
+                    message_id: msg20260608zt5y8u2i6o1pa
+                    email_id: null
+                    from_status: null
+                    to_status: null
+                next_cursor: null
+                has_more: false
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /api/v1/leads/{external_id}/thread:
+    get:
+      operationId: getLeadThread
+      tags: [Leads]
+      summary: Get a lead's full engagement thread
+      description: |
+        Returns the lead's complete engagement transcript as a single
+        chronologically interleaved thread across all channels — voice calls,
+        SMS, WhatsApp, and email — in the order the lead experienced them,
+        oldest first.
+
+        Each entry is a discriminated union (discriminate on `type`) carrying
+        its classification (`classification_status` and nullable `intent`)
+        alongside the full channel payload: call transcript, message body, or
+        email body. Use this endpoint to render the whole conversation in your
+        CRM's activity timeline, or to audit exactly what the AI said and when.
+
+        The `items` array is cursor-paginated: pass `next_cursor` back as
+        `cursor` to fetch the next page of entries. Lead-level fields (status,
+        intent, extracted metadata) repeat on every page.
+      parameters:
+        - $ref: '#/components/parameters/ExternalId'
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: >-
+            A page of the lead's interleaved engagement thread, oldest first.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Thread'
+              example:
+                lead_id: led20260512zr7k2m4xq9p3v
+                external_id: 00Q5f000001AbCdEAV
+                status: interested
+                intent: voice_interested_with_booked_time
+                started_at: '2026-05-13T15:00:00Z'
+                last_activity_at: '2026-06-09T14:21:47Z'
+                extracted_metadata:
+                  - field_name: interested_courses
+                    values:
+                      - RN-to-BSN
+                    extracted_at: '2026-06-08T19:10:00Z'
+                items:
+                  - type: email
+                    occurred_at: '2026-05-28T13:00:02Z'
+                    classification_status: completed
+                    intent: null
+                    email:
+                      id: eml20260528zw2e5r8t1y4ui
+                      lead_id: led20260512zr7k2m4xq9p3v
+                      external_id: 00Q5f000001AbCdEAV
+                      direction: outbound
+                      subject: Your RN-to-BSN application — next steps
+                      body_text: >-
+                        Hi Maria, following up on your inquiry about the
+                        RN-to-BSN program...
+                      from_address: advisor@school.usehavana.com
+                      to_address: maria.santos@example.com
+                      ccs: null
+                      reply_to: null
+                      message_id: <CADxyz123@mail.usehavana.com>
+                      in_reply_to_message_id: null
+                      sent_at: '2026-05-28T13:00:02Z'
+                      open_count: 2
+                      is_bounce: false
+                      is_manual: false
+                      classification_status: completed
+                      intent: null
+                      created_at: '2026-05-28T13:00:00Z'
+                  - type: message
+                    occurred_at: '2026-06-08T19:05:12Z'
+                    classification_status: completed
+                    intent: messaging_interested
+                    message:
+                      id: msg20260608zt5y8u2i6o1pa
+                      lead_id: led20260512zr7k2m4xq9p3v
+                      external_id: 00Q5f000001AbCdEAV
+                      conversation_id: mcv20260608zb4n7m1k9j5hg
+                      channel: sms
+                      direction: inbound
+                      body: Yes I'm still interested, can you call me after 2pm?
+                      status: received
+                      sent_at: '2026-06-08T19:05:12Z'
+                      read_at: null
+                      delivery_error_code: null
+                      classification_status: completed
+                      intent: messaging_interested
+                      created_at: '2026-06-08T19:05:10Z'
+                  - type: call
+                    occurred_at: '2026-06-09T14:21:47Z'
+                    classification_status: pending
+                    intent: null
+                    call:
+                      id: vca20260609z8h3n6tq2w5dy
+                      lead_id: led20260512zr7k2m4xq9p3v
+                      external_id: 00Q5f000001AbCdEAV
+                      status: completed
+                      direction: outbound
+                      called_at: '2026-06-09T14:21:47Z'
+                      completed_at: '2026-06-09T14:26:33Z'
+                      duration_seconds: 286
+                      phone_number: '+13125550148'
+                      outgoing_number: '+13125550190'
+                      time_zone: America/Chicago
+                      transcript: "Agent: Hi, may I speak with Maria?\nUser: Speaking."
+                      transcript_summary: null
+                      recording_url: https://api.usehavana.com/v1/recordings/vca20260609z8h3n6tq2w5dy?sig=abc123
+                      voicemail_detected: false
+                      is_callback: true
+                      is_transferred: false
+                      transfer_status: null
+                      detected_language: en
+                      classification_status: pending
+                      intent: null
+                      created_at: '2026-06-09T14:21:40Z'
+                next_cursor: null
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /api/v1/calls/{id}:
+    get:
+      operationId: getCall
+      tags: [Calls]
+      summary: Get a call
+      description: |
+        Returns the full detail of a single call: the complete transcript, a
+        time-limited recording URL, duration, classification (`intent` and
+        `classification_status`), whether the call was a scheduled callback
+        (`is_callback`), and the transfer outcome if a live handoff to a human
+        rep was attempted.
+
+        A `call.completed` webhook fires as soon as the call ends — at that
+        point `classification_status` is typically `pending` and `intent` is
+        `null`. Re-fetch this endpoint (or wait for the `lead.classified`
+        webhook) to get the final classification. Recording URLs are signed and
+        expire; fetch a fresh URL from this endpoint when you need one.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: The Havana call ID (as delivered in webhooks and activity rows).
+          schema:
+            type: string
+          example: vca20260601z8h3n6tq2w5dy
+      responses:
+        '200':
+          description: The call.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Call'
+              example:
+                id: vca20260601z8h3n6tq2w5dy
+                lead_id: led20260512zr7k2m4xq9p3v
+                external_id: 00Q5f000001AbCdEAV
+                status: completed
+                direction: outbound
+                called_at: '2026-06-01T16:20:05Z'
+                completed_at: '2026-06-01T16:24:51Z'
+                duration_seconds: 286
+                phone_number: '+13125550148'
+                outgoing_number: '+13125550190'
+                time_zone: America/Chicago
+                transcript: "Agent: Hi, may I speak with Maria?\nUser: Speaking.\nAgent: This is Ava calling about your RN-to-BSN inquiry — is now still a good time?\nUser: Yes, perfect timing actually."
+                transcript_summary: >-
+                  Lead confirmed interest and booked a callback for Tuesday 2pm
+                  CT.
+                recording_url: https://api.usehavana.com/v1/recordings/vca20260601z8h3n6tq2w5dy?sig=abc123
+                voicemail_detected: false
+                is_callback: true
+                is_transferred: false
+                transfer_status: null
+                detected_language: en
+                classification_status: completed
+                intent: voice_interested_with_booked_time
+                created_at: '2026-06-01T16:19:58Z'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /api/v1/leads/{external_id}/appointments:
+    get:
+      operationId: listLeadAppointments
+      tags: [Appointments]
+      summary: List a lead's appointments
+      description: |
+        Returns appointments booked for the lead (e.g. enrollment-advisor calls
+        scheduled by the AI during a voice call, via SMS/WhatsApp, or through a
+        booking page), newest first. Each appointment includes its scheduled
+        time, the time zone it was booked in, current status, and the booking
+        backend through which it was recorded. `source_call_id` /
+        `source_conversation_id` identify which interaction produced the
+        booking.
+      parameters:
+        - $ref: '#/components/parameters/ExternalId'
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: A page of the lead's appointments, newest first.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedAppointments'
+              example:
+                data:
+                  - id: apt20260604zc6v9b3n7m2kl
+                    lead_id: led20260512zr7k2m4xq9p3v
+                    external_id: 00Q5f000001AbCdEAV
+                    appointment_time: '2026-06-09T19:00:00Z'
+                    timezone: America/Chicago
+                    status: booked
+                    booking_backend: handoff
+                    external_appointment_id: null
+                    source_call_id: vca20260601z8h3n6tq2w5dy
+                    source_conversation_id: null
+                    phone_number: '+13125550148'
+                    meeting_url: null
+                    reference_code: null
+                    cancelled_at: null
+                    cancellation_reason: null
+                    created_at: '2026-06-01T16:24:40Z'
+                    updated_at: '2026-06-01T16:24:40Z'
+                next_cursor: null
+                has_more: false
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+webhooks:
+  lead.status_changed:
+    post:
+      operationId: webhookLeadStatusChanged
+      tags: [Webhooks]
+      summary: Lead thread status changed
+      description: |
+        Fires whenever a lead's thread status transitions, e.g. `not_started` →
+        `contacted` → `replied` → `interested`.
+
+        `data.status` and `data.previous_status` are drawn from the
+        `LeadStatus` enum. Note that a transition to `unsubscribed`
+        additionally emits a dedicated `lead.unsubscribed` event, and
+        `interested` (Qualified) transitions are often immediately preceded by
+        the `lead.classified` event that caused them — use `sequence` to order
+        the two.
+
+        The payload is thin: IDs + the transition. Pull
+        `GET /api/v1/leads/{external_id}` for full lead state.
+
+        **Acknowledge** with any 2xx within 10 seconds. **Retries:** non-2xx /
+        timeout deliveries are retried with exponential backoff (~8 attempts
+        over 72h), then dead-lettered with 14-day retention and manual or API
+        redelivery. Verify the `X-Havana-Signature` HMAC-SHA256 header before
+        processing.
+      parameters:
+        - $ref: '#/components/parameters/HavanaSignature'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WebhookEnvelope'
+            example:
+              id: evt20260610zh7j4k1l8p5qw
+              type: lead.status_changed
+              sequence: 7
+              occurred_at: '2026-06-10T14:32:05Z'
+              data:
+                lead_id: led20260512zr7k2m4xq9p3v
+                external_id: 00Q5f000001AbCdEAV
+                previous_status: replied
+                status: interested
+      responses:
+        '2XX':
+          description: >-
+            Delivery acknowledged. Any 2xx status stops retries. Response body
+            is ignored.
+        '4XX':
+          description: >-
+            Treated as failure. The delivery is retried with exponential
+            backoff and dead-lettered after the final attempt. Redirects (3xx)
+            are not followed and also count as failures.
+        default:
+          description: >-
+            Any other non-2xx status, timeout, or connection error is treated
+            as failure and retried with exponential backoff.
+
+  lead.classified:
+    post:
+      operationId: webhookLeadClassified
+      tags: [Webhooks]
+      summary: Async classification completed for an activity
+      description: |
+        Fires when the async classifier finishes classifying an engagement
+        (call, message thread, or email reply) for a lead. Classification is
+        asynchronous: activity-producing events (notably `call.completed`) fire
+        immediately with `classification_status: pending`; `lead.classified`
+        follows — typically within minutes — once the classifier lands. Late
+        classifications also bump the lead's `updated_at`, so delta polls on
+        `updated_since` pick them up without webhooks.
+
+        `data.intent` is the resolved intent for the activity's channel — see
+        the `VoiceIntent`, `MessagingIntent`, and `EmailIntent` schemas for the
+        per-channel value sets.
+
+        The payload is thin: IDs + the intent. Pull `GET /api/v1/calls/{id}` or
+        `GET /api/v1/leads/{external_id}/activities` for the full record
+        (transcript, recording, transfer outcome, etc.).
+
+        **Acknowledge** with any 2xx within 10 seconds. **Retries:**
+        exponential backoff (~8 attempts over 72h), then dead-letter with
+        14-day retention and redelivery. Verify the `X-Havana-Signature`
+        HMAC-SHA256 header before processing.
+      parameters:
+        - $ref: '#/components/parameters/HavanaSignature'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WebhookEnvelope'
+            example:
+              id: evt20260610zp8r2t6v4x9z7b
+              type: lead.classified
+              sequence: 6
+              occurred_at: '2026-06-10T14:29:48Z'
+              data:
+                lead_id: led20260512zr7k2m4xq9p3v
+                external_id: 00Q5f000001AbCdEAV
+                activity_id: act20260610z9d4w7n2q5ke
+                call_id: vca20260610z9d4w7n2q5ke
+                channel: voice
+                classification_status: completed
+                intent: voice_interested_with_booked_time
+      responses:
+        '2XX':
+          description: >-
+            Delivery acknowledged. Any 2xx status stops retries. Response body
+            is ignored.
+        '4XX':
+          description: >-
+            Treated as failure. The delivery is retried with exponential
+            backoff and dead-lettered after the final attempt. Redirects (3xx)
+            are not followed and also count as failures.
+        default:
+          description: >-
+            Any other non-2xx status, timeout, or connection error is treated
+            as failure and retried with exponential backoff.
+
+  call.completed:
+    post:
+      operationId: webhookCallCompleted
+      tags: [Webhooks]
+      summary: Voice call completed (classification still pending)
+      description: |
+        Fires immediately when a voice call ends — before the async classifier
+        has run — so `data.classification_status` is always `pending` and
+        `data.intent` is `null`. A `lead.classified` event for the same
+        `call_id` follows once the classifier lands (use `sequence` to order
+        them). Do not wait on this event for intent; if you only care about the
+        classified outcome, consume `lead.classified` or poll
+        `GET /api/v1/leads?updated_since=...` instead.
+
+        The payload is thin: IDs + terminal call status. Pull
+        `GET /api/v1/calls/{id}` for the transcript, recording URL, duration,
+        `is_callback`, transfer outcome, and (once available) intent.
+
+        **Acknowledge** with any 2xx within 10 seconds. **Retries:**
+        exponential backoff (~8 attempts over 72h), then dead-letter with
+        14-day retention and redelivery. Verify the `X-Havana-Signature`
+        HMAC-SHA256 header before processing.
+      parameters:
+        - $ref: '#/components/parameters/HavanaSignature'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WebhookEnvelope'
+            example:
+              id: evt20260610zk3m8p2r7t4v9x
+              type: call.completed
+              sequence: 5
+              occurred_at: '2026-06-10T14:27:11Z'
+              data:
+                lead_id: led20260512zr7k2m4xq9p3v
+                external_id: 00Q5f000001AbCdEAV
+                call_id: vca20260610z9d4w7n2q5ke
+                call_status: completed
+                is_callback: false
+                classification_status: pending
+                intent: null
+      responses:
+        '2XX':
+          description: >-
+            Delivery acknowledged. Any 2xx status stops retries. Response body
+            is ignored.
+        '4XX':
+          description: >-
+            Treated as failure. The delivery is retried with exponential
+            backoff and dead-lettered after the final attempt. Redirects (3xx)
+            are not followed and also count as failures.
+        default:
+          description: >-
+            Any other non-2xx status, timeout, or connection error is treated
+            as failure and retried with exponential backoff.
+
+  lead.unsubscribed:
+    post:
+      operationId: webhookLeadUnsubscribed
+      tags: [Webhooks]
+      summary: Lead opted out (DNC)
+      description: |
+        Fires when a lead opts out of contact on any channel and their thread
+        status moves to `unsubscribed` (DNC/Unsubscribed). Emitted in addition
+        to the corresponding `lead.status_changed` event so opt-out consumers
+        can subscribe to a single, unambiguous signal. This event is
+        time-sensitive: suppress the record in your CRM promptly to stay
+        compliant — but as with all events, your next `updated_since` poll
+        carries the same state if delivery fails.
+
+        `data.intent` (when known) is the classifier intent that triggered the
+        opt-out: `voice_unsubscribed`, `messaging_unsubscribed`,
+        `messaging_immediate_stop`, or `unsubscribed` (email). `data.channel`
+        is one of `voice`, `sms`, `whatsapp`, `email`.
+
+        The payload is thin: IDs + channel + triggering intent. Pull
+        `GET /api/v1/leads/{external_id}` for full lead state.
+
+        **Acknowledge** with any 2xx within 10 seconds. **Retries:**
+        exponential backoff (~8 attempts over 72h), then dead-letter with
+        14-day retention and redelivery. Verify the `X-Havana-Signature`
+        HMAC-SHA256 header before processing.
+      parameters:
+        - $ref: '#/components/parameters/HavanaSignature'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WebhookEnvelope'
+            example:
+              id: evt20260610zr2u8w3y6a1c5e
+              type: lead.unsubscribed
+              sequence: 9
+              occurred_at: '2026-06-10T15:01:40Z'
+              data:
+                lead_id: led20260507zp3f9t6rq2w8d
+                external_id: 00Q5f000001ZyXwVEAV
+                channel: sms
+                intent: messaging_unsubscribed
+                status: unsubscribed
+      responses:
+        '2XX':
+          description: >-
+            Delivery acknowledged. Any 2xx status stops retries. Response body
+            is ignored.
+        '4XX':
+          description: >-
+            Treated as failure. The delivery is retried with exponential
+            backoff and dead-lettered after the final attempt. Redirects (3xx)
+            are not followed and also count as failures.
+        default:
+          description: >-
+            Any other non-2xx status, timeout, or connection error is treated
+            as failure and retried with exponential backoff.
+
+  handoff.requested:
+    post:
+      operationId: webhookHandoffRequested
+      tags: [Webhooks]
+      summary: Lead requested a human handoff
+      description: |
+        Fires when an engagement is classified with a handoff-shaped intent —
+        the lead asked for a person, a callback, or was transferred. Triggering
+        intents: `voice_wants_call_back`, `voice_transferred_call`,
+        `voice_callback_no_answer`, `messaging_wants_call_back`,
+        `messaging_forward_to_rep`, and `forward_to_rep` (email).
+
+        Because handoff intents come from the async classifier, this event
+        always follows the underlying `call.completed` (or message activity)
+        rather than firing during the engagement — it is the "your rep should
+        act now" accelerator. The payload is thin: IDs + the triggering intent.
+        Pull `GET /api/v1/calls/{id}` (for voice) or
+        `GET /api/v1/leads/{external_id}/thread` for the conversation context
+        your rep needs, and `GET /api/v1/leads/{external_id}/appointments` for
+        any booked time (`data.appointment_id` is set when the handoff carries
+        a scheduled callback).
+
+        **Acknowledge** with any 2xx within 10 seconds. **Retries:**
+        exponential backoff (~8 attempts over 72h), then dead-letter with
+        14-day retention and redelivery. Verify the `X-Havana-Signature`
+        HMAC-SHA256 header before processing.
+      parameters:
+        - $ref: '#/components/parameters/HavanaSignature'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WebhookEnvelope'
+            example:
+              id: evt20260610zt4w9y2a7c3e8g
+              type: handoff.requested
+              sequence: 11
+              occurred_at: '2026-06-10T15:18:22Z'
+              data:
+                lead_id: led20260601zq7v2j8dk4n1m
+                external_id: 00Q5f000001MnOpQEAV
+                activity_id: act20260610zb5k1x4mq8w2e
+                call_id: vca20260610zb5k1x4mq8w2e
+                appointment_id: apt20260610zc6v9b3n7m2kl
+                channel: voice
+                intent: voice_wants_call_back
+      responses:
+        '2XX':
+          description: >-
+            Delivery acknowledged. Any 2xx status stops retries. Response body
+            is ignored.
+        '4XX':
+          description: >-
+            Treated as failure. The delivery is retried with exponential
+            backoff and dead-lettered after the final attempt. Redirects (3xx)
+            are not followed and also count as failures.
+        default:
+          description: >-
+            Any other non-2xx status, timeout, or connection error is treated
+            as failure and retried with exponential backoff.
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: hav_key
+      description: >-
+        Per-team API key passed as `Authorization: Bearer hav_...`. Keys are
+        scoped to a single team (tenant); all records returned belong to the
+        authenticated team. Keys can be rotated from the Havana dashboard.
+
+  parameters:
+    ExternalId:
+      name: external_id
+      in: path
+      required: true
+      description: The lead's record ID in your CRM (e.g. a Salesforce Lead ID).
+      schema:
+        type: string
+      example: 00Q5f000001AbCdEAV
+
+    Cursor:
+      name: cursor
+      in: query
+      required: false
+      description: >-
+        Opaque pagination cursor returned as `next_cursor` by a previous page.
+        Omit for the first page.
+      schema:
+        type: string
+      example: eyJ1cGRhdGVkX2F0IjoiMjAyNi0wNi0wOVQxNDoyMjowMVoifQ
+
+    Limit:
+      name: limit
+      in: query
+      required: false
+      description: Maximum number of records to return per page.
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 200
+        default: 50
+      example: 100
+
+    HavanaSignature:
+      name: X-Havana-Signature
+      in: header
+      required: true
+      description: >-
+        HMAC-SHA256 signature of the raw request body, keyed with your
+        endpoint's signing secret. Format:
+        `t=<unix_ts>,v1=<hex(hmac_sha256(secret, "<unix_ts>.<raw body>"))>`.
+        During signing-secret rotation the header may carry multiple `v1=`
+        entries (one per active secret); treat the signature as valid if ANY
+        `v1` value matches. Verify before trusting the payload, and reject
+        timestamps older than 5 minutes to prevent replay.
+      schema:
+        type: string
+      example: t=1781000000,v1=5f7a2c0d9e8b1a4c6d3e2f1a0b9c8d7e6f5a4b3c2d1e0f9a8b7c6d5e4f3a2b1c
+
+  responses:
+    Unauthorized:
+      description: Missing or invalid API key.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            code: unauthorized
+            message: Invalid or missing API key.
+            detail:
+              hint: 'Provide a valid key in the Authorization header: Bearer hav_...'
+
+    NotFound:
+      description: >-
+        Resource not found. For lead-scoped endpoints, no lead with this
+        `external_id` exists for the authenticated team.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            code: not_found
+            message: No lead found with external_id 00Q5f000001AbCdEAV.
+            detail:
+              parameter: external_id
+
+    RateLimited:
+      description: Rate limit exceeded. Retry after the indicated delay.
+      headers:
+        Retry-After:
+          description: Seconds to wait before retrying.
+          schema:
+            type: integer
+          example: 30
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            code: rate_limited
+            message: Too many requests.
+            detail:
+              limit: 600
+              window: 1m
+              retry_after_seconds: 30
+
+  schemas:
+    LeadStatus:
+      type: string
+      description: >-
+        Lifecycle status of the lead's engagement thread. Values are stable
+        snake_case API identifiers; dashboard display names differ for two
+        values. Display names: `not_started` = "Not Started", `contacted` =
+        "Contacted", `replied` = "Replied", `interested` = "Qualified",
+        `not_interested` = "Not Interested", `bounced` = "Bounced",
+        `unresponsive` = "Unresponsive", `unsubscribed` = "DNC/Unsubscribed",
+        `needs_human_review` = "Needs Human Review", `intentionally_stopped` =
+        "Intentionally Stopped".
+      enum:
+        - not_started
+        - contacted
+        - replied
+        - interested
+        - not_interested
+        - bounced
+        - unresponsive
+        - unsubscribed
+        - needs_human_review
+        - intentionally_stopped
+      example: interested
+
+    ClassificationStatus:
+      type: string
+      description: >-
+        Whether Havana's async classifier has finished processing this
+        artifact. `pending` means the artifact (call, message, email) exists
+        but `intent` is not yet populated; `completed` means classification has
+        landed and `intent` is final. `call.completed` webhooks fire
+        immediately with `pending`; a `lead.classified` event follows when the
+        classifier lands. Late classifications bump the lead's `updated_at`,
+        so delta polling on `updated_since` will pick them up.
+      enum:
+        - pending
+        - completed
+      example: completed
+
+    Channel:
+      type: string
+      description: >-
+        Communication channel of an engagement artifact. `system` is used for
+        synthetic activity rows such as status transitions.
+      enum:
+        - voice
+        - sms
+        - whatsapp
+        - email
+        - system
+      example: voice
+
+    VoiceIntent:
+      type: string
+      description: >-
+        Classified outcome of a voice call. Assigned asynchronously by Havana's
+        call classifier after the call completes.
+      enum:
+        - voice_call_responded
+        - voice_interested
+        - voice_interested_with_booked_time
+        - voice_interested_with_unbooked_time
+        - voice_voice_mail
+        - voice_not_interested
+        - voice_incomplete_call
+        - voice_wrong_number
+        - voice_wants_call_back
+        - voice_wants_email_follow_up
+        - voice_wants_whatsapp_sms_follow_up
+        - voice_no_action
+        - voice_unsubscribed
+        - voice_unknown
+        - voice_immediate_hangup
+        - voice_transferred_call
+        - voice_callback_no_answer
+      example: voice_interested_with_booked_time
+
+    MessagingIntent:
+      type: string
+      description: >-
+        Classified outcome of an inbound SMS/WhatsApp message. Assigned
+        asynchronously by Havana's messaging classifier.
+      enum:
+        - messaging_interested
+        - messaging_interested_with_booked_time
+        - messaging_interested_with_unbooked_time
+        - messaging_not_interested
+        - messaging_wrong_number
+        - messaging_wants_message_back
+        - messaging_wants_call_back
+        - messaging_wants_email_follow_up
+        - messaging_forward_to_rep
+        - messaging_immediate_stop
+        - messaging_continue_campaign
+        - messaging_no_action
+        - messaging_unknown
+        - messaging_needs_clarification
+        - messaging_unsubscribed
+      example: messaging_wants_call_back
+
+    EmailIntent:
+      type: string
+      description: >-
+        Classified outcome of an inbound email. Assigned asynchronously by
+        Havana's email classifier.
+      enum:
+        - bounced
+        - unknown
+        - interested
+        - more_info
+        - more_info_pricing
+        - more_info_requirements
+        - not_interested
+        - unsubscribed
+        - no_action
+        - needs_full_scholarship
+        - no_english
+        - needs_clarification
+        - forward_to_rep
+      example: more_info_pricing
+
+    SystemIntent:
+      type: string
+      description: >-
+        A system-assigned intent written by Havana itself rather than by a
+        channel classifier. `intentionally_stopped` is recorded against an
+        activity when outreach on that thread was deliberately halted by an
+        operator or a campaign rule (not by the lead's behavior). It can
+        appear on activities of any channel. Treat it as operational noise:
+        log it, do not change pipeline stage, and rely on the lead's `status`
+        field (which will also read `intentionally_stopped`) for lifecycle
+        decisions.
+      enum:
+        - intentionally_stopped
+      example: intentionally_stopped
+
+    Intent:
+      description: >-
+        A classified intent from any channel. Voice intents are prefixed
+        `voice_`, messaging intents `messaging_`; email intents are unprefixed.
+        See VoiceIntent, MessagingIntent, and EmailIntent for the per-channel
+        value sets. Activities whose outreach was deliberately halted by an
+        operator or campaign rule carry the system-assigned
+        `intentionally_stopped` value (see SystemIntent) regardless of
+        channel. Havana-internal engine classifications (such as the
+        `engine_v2_*` family) are not part of the public surface and are
+        never emitted by this API: the API layer maps or filters them to the
+        public taxonomies above before exposure.
+      oneOf:
+        - $ref: '#/components/schemas/VoiceIntent'
+        - $ref: '#/components/schemas/MessagingIntent'
+        - $ref: '#/components/schemas/EmailIntent'
+        - $ref: '#/components/schemas/SystemIntent'
+      example: voice_interested
+
+    EngagementCounts:
+      type: object
+      description: >-
+        Per-channel engagement counters for a lead, aggregated across the
+        lead's campaign thread. Useful for writing summary fields back into
+        your CRM without enumerating activities.
+      properties:
+        calls:
+          type: integer
+          description: Total dials placed to (or received from) the lead.
+          example: 4
+        calls_answered:
+          type: integer
+          description: Calls where the lead answered and responded.
+          example: 1
+        emails_sent:
+          type: integer
+          description: Outbound emails sent to the lead.
+          example: 3
+        emails_received:
+          type: integer
+          description: Inbound emails received from the lead.
+          example: 1
+        email_opens:
+          type: integer
+          description: Tracked opens across all outbound emails.
+          example: 5
+        messages_sent:
+          type: integer
+          description: Outbound SMS/WhatsApp messages sent to the lead.
+          example: 2
+        messages_received:
+          type: integer
+          description: Inbound SMS/WhatsApp messages received from the lead.
+          example: 1
+
+    Lead:
+      type: object
+      description: >-
+        A lead known to Havana, keyed for your convenience by `external_id`
+        (your CRM record ID). Poll `GET /api/v1/leads?updated_since=...` to
+        receive leads whose data changed — including late async
+        classifications, which bump `updated_at`.
+      required:
+        - id
+        - status
+        - created_at
+        - import_source
+        - unsubscribed
+        - bounced
+        - invalid_number
+        - is_inbound
+      properties:
+        id:
+          type: string
+          description: Havana's internal lead ID. Stable and unique per team.
+          example: led20260512zr7k2m4xq9p3v
+        external_id:
+          type: ['string', 'null']
+          description: >-
+            Your CRM record ID for this lead (e.g. a Salesforce Lead Id),
+            captured at import time. Null when the lead was created without a
+            CRM reference (e.g. manual or inbound-originated leads).
+          example: 00Q5f000001AbCdEAV
+        status:
+          $ref: '#/components/schemas/LeadStatus'
+        intent:
+          description: >-
+            Latest classified intent across all channels for this lead's
+            engagement thread. Null until the first classification lands.
+          anyOf:
+            - $ref: '#/components/schemas/Intent'
+            - type: 'null'
+          example: voice_interested
+        first_name:
+          type: ['string', 'null']
+          description: Lead's first name. Null when not provided at import.
+          example: Maria
+        last_name:
+          type: ['string', 'null']
+          description: Lead's last name. Null when not provided at import.
+          example: Santos
+        email:
+          type: ['string', 'null']
+          description: Lead's email address. Null when not provided.
+          example: maria.santos@example.com
+        phone_number:
+          type: ['string', 'null']
+          description: Lead's phone number in E.164 format. Null when not provided.
+          example: '+13125550148'
+        import_source:
+          type: string
+          description: >-
+            How the lead entered Havana, e.g. `salesforce`, `hubspot`, `csv`,
+            or `webhook`.
+          example: salesforce
+        external_status:
+          type: ['string', 'null']
+          description: >-
+            The status string for this lead as last seen in your CRM, if your
+            integration syncs it.
+          example: Working - Contacted
+        external_synced_at:
+          type: ['string', 'null']
+          format: date-time
+          description: >-
+            When Havana last synced this lead with your CRM. Null if no CRM
+            sync is configured.
+          example: '2026-06-09T14:02:11Z'
+        time_zone:
+          type: ['string', 'null']
+          description: >-
+            IANA time zone Havana resolved for the lead (state takes priority
+            over phone area code). Used for call-window scheduling.
+          example: America/Chicago
+        state:
+          type: ['string', 'null']
+          description: US state used for time zone and calling-window rules.
+          example: IL
+        unsubscribed:
+          type: boolean
+          description: >-
+            True if the lead opted out of contact (DNC). Mirrors the
+            `unsubscribed` thread status and the `lead.unsubscribed` webhook.
+          example: false
+        bounced:
+          type: boolean
+          description: True if the lead's email address hard-bounced.
+          example: false
+        invalid_number:
+          type: boolean
+          description: True if the lead's phone number was found to be invalid.
+          example: false
+        is_inbound:
+          type: boolean
+          description: >-
+            True if the lead originated from inbound contact (they called or
+            messaged first) rather than an outbound import.
+          example: false
+        is_test:
+          type: boolean
+          description: >-
+            True for test leads created by your team or Havana. Test leads are
+            excluded from Havana reporting; filter on this field if you do not
+            want them in your CRM.
+          example: false
+        custom_fields:
+          type: object
+          description: >-
+            Custom and imported fields carried with the lead, keyed by field
+            name — typically the CRM columns supplied at import (e.g.
+            `inquiry_age_c`). Values are passed through as imported.
+          additionalProperties: true
+          example:
+            inquiry_age_c: '14'
+            program_of_interest: RN-to-BSN
+        counts:
+          $ref: '#/components/schemas/EngagementCounts'
+        created_at:
+          type: string
+          format: date-time
+          description: When the lead was created in Havana.
+          example: '2026-05-12T09:30:00Z'
+        updated_at:
+          type: ['string', 'null']
+          format: date-time
+          description: >-
+            When the lead or any of its engagement data last changed. This is
+            the delta-sync key for `updated_since` polling; late async
+            classifications bump this timestamp.
+          example: '2026-06-09T18:45:31Z'
+
+    Activity:
+      type: object
+      description: >-
+        A single engagement event on a lead's timeline: a call, an inbound or
+        outbound message or email, or a status transition. Calls, messages, and
+        emails carry an async `classification_status`; fetch the referenced
+        resource (e.g. `GET /api/v1/calls/{id}`) for full detail.
+      required:
+        - id
+        - type
+        - channel
+        - occurred_at
+        - classification_status
+      properties:
+        id:
+          type: string
+          description: Unique ID of this activity row.
+          example: act20260601zq8w3e7r2t9yu
+        lead_id:
+          type: string
+          description: Havana lead ID this activity belongs to.
+          example: led20260512zr7k2m4xq9p3v
+        external_id:
+          type: ['string', 'null']
+          description: >-
+            Your CRM record ID for the lead this activity belongs to. Null if
+            the lead has no CRM reference.
+          example: 00Q5f000001AbCdEAV
+        type:
+          type: string
+          description: >-
+            Kind of activity. `call` for voice calls, `message` for SMS and
+            WhatsApp messages, `email` for inbound/outbound emails,
+            `status_change` for lead status transitions.
+          enum:
+            - call
+            - message
+            - email
+            - status_change
+          example: call
+        channel:
+          $ref: '#/components/schemas/Channel'
+        direction:
+          type: ['string', 'null']
+          description: >-
+            Direction of the engagement: `outbound` (Havana to lead) or
+            `inbound` (lead to Havana). Null for `status_change` rows.
+          enum:
+            - outbound
+            - inbound
+            - null
+          example: outbound
+        occurred_at:
+          type: string
+          format: date-time
+          description: When the activity happened. Timeline sort key.
+          example: '2026-06-01T16:20:05Z'
+        classification_status:
+          $ref: '#/components/schemas/ClassificationStatus'
+        intent:
+          description: >-
+            Classified intent for this activity. Null while
+            `classification_status` is `pending`, and always null for
+            `status_change` rows.
+          anyOf:
+            - $ref: '#/components/schemas/Intent'
+            - type: 'null'
+          example: voice_interested
+        summary:
+          type: ['string', 'null']
+          description: >-
+            Short AI-generated summary of the interaction, when available
+            (e.g. call transcript summary or conversation summary).
+          example: Lead confirmed interest and booked a callback for Tuesday 2pm CT.
+        call_id:
+          type: ['string', 'null']
+          description: >-
+            ID of the underlying call when `type` is `call`. Resolve via
+            `GET /api/v1/calls/{id}`. Null otherwise.
+          example: vca20260601z8h3n6tq2w5dy
+        message_id:
+          type: ['string', 'null']
+          description: ID of the underlying message when `type` is `message`. Null otherwise.
+          example: null
+        email_id:
+          type: ['string', 'null']
+          description: ID of the underlying email when `type` is `email`. Null otherwise.
+          example: null
+        from_status:
+          anyOf:
+            - $ref: '#/components/schemas/LeadStatus'
+            - type: 'null'
+          description: >-
+            Previous lead status when `type` is `status_change`. Null
+            otherwise.
+          example: null
+        to_status:
+          anyOf:
+            - $ref: '#/components/schemas/LeadStatus'
+            - type: 'null'
+          description: >-
+            New lead status when `type` is `status_change`. Null otherwise.
+          example: null
+
+    Call:
+      type: object
+      description: >-
+        A voice call placed to or received from a lead, including transcript,
+        recording, and transfer outcome. `intent` is populated asynchronously:
+        the `call.completed` webhook fires immediately with
+        `classification_status: pending`, and a `lead.classified` event follows
+        once the classifier lands.
+      required:
+        - id
+        - lead_id
+        - status
+        - direction
+        - is_callback
+        - is_transferred
+        - voicemail_detected
+        - classification_status
+        - created_at
+      properties:
+        id:
+          type: string
+          description: Havana's internal call ID.
+          example: vca20260601z8h3n6tq2w5dy
+        lead_id:
+          type: string
+          description: Havana lead ID the call belongs to.
+          example: led20260512zr7k2m4xq9p3v
+        external_id:
+          type: ['string', 'null']
+          description: >-
+            Your CRM record ID for the lead this call belongs to. Null if the
+            lead has no CRM reference.
+          example: 00Q5f000001AbCdEAV
+        status:
+          type: string
+          description: >-
+            Call delivery status, e.g. `completed`, `no_answer`, `busy`,
+            `failed`, or `incoming`. Intermediate statuses such as
+            `completed_pending` (call finished, post-processing still running)
+            may also appear; tolerate unknown values.
+          example: completed
+        direction:
+          type: string
+          description: '`outbound` for Havana-initiated dials, `inbound` for calls from the lead.'
+          enum:
+            - outbound
+            - inbound
+          example: outbound
+        called_at:
+          type: ['string', 'null']
+          format: date-time
+          description: When the call was dialed (or received). Null if never dialed.
+          example: '2026-06-01T16:20:05Z'
+        completed_at:
+          type: ['string', 'null']
+          format: date-time
+          description: When the call ended. Null while in progress or if never connected.
+          example: '2026-06-01T16:24:51Z'
+        duration_seconds:
+          type: ['integer', 'null']
+          description: >-
+            Call duration in seconds, derived from `completed_at - called_at`.
+            Null when either timestamp is missing.
+          example: 286
+        phone_number:
+          type: ['string', 'null']
+          description: The lead's number that was dialed (E.164).
+          example: '+13125550148'
+        outgoing_number:
+          type: ['string', 'null']
+          description: The Havana caller ID used for the call (E.164).
+          example: '+13125550190'
+        time_zone:
+          type: ['string', 'null']
+          description: IANA time zone the call was scheduled in.
+          example: America/Chicago
+        transcript:
+          type: ['string', 'null']
+          description: >-
+            Full diarized transcript of the call. Null when no conversation was
+            captured (e.g. no answer).
+          example: "Agent: Hi, is this Maria?\nUser: Yes, speaking."
+        transcript_summary:
+          type: ['string', 'null']
+          description: AI-generated summary of the call transcript.
+          example: Lead confirmed interest and booked a callback for Tuesday 2pm CT.
+        recording_url:
+          type: ['string', 'null']
+          description: >-
+            Time-limited signed URL to the call recording audio. Null when no
+            recording exists. Re-fetch the call to obtain a fresh URL.
+          example: https://api.usehavana.com/v1/recordings/vca20260601z8h3n6tq2w5dy?sig=abc123
+        voicemail_detected:
+          type: boolean
+          description: True if the call reached voicemail.
+          example: false
+        is_callback:
+          type: boolean
+          description: >-
+            True when the call was a scheduled callback (lead-requested time)
+            rather than an immediate campaign dial. This is the canonical
+            scheduled-vs-immediate flag.
+          example: true
+        is_transferred:
+          type: boolean
+          description: True if the call was handed off live to a human rep.
+          example: false
+        transfer_status:
+          type: ['string', 'null']
+          description: >-
+            Status of the human-transfer leg when a transfer was attempted,
+            e.g. `transferred`, `transfer_pending`, `transfer_no_pickup`. Null
+            when no transfer was attempted.
+          example: null
+        detected_language:
+          type: ['string', 'null']
+          description: Language detected for the lead during the call (BCP 47 tag).
+          example: en
+        classification_status:
+          $ref: '#/components/schemas/ClassificationStatus'
+        intent:
+          description: >-
+            Classified call outcome. Null while `classification_status` is
+            `pending`.
+          anyOf:
+            - $ref: '#/components/schemas/VoiceIntent'
+            - type: 'null'
+          example: voice_interested_with_booked_time
+        created_at:
+          type: string
+          format: date-time
+          description: When the call record was created in Havana.
+          example: '2026-06-01T16:19:58Z'
+
+    Message:
+      type: object
+      description: >-
+        A single SMS or WhatsApp message exchanged with a lead. Inbound
+        messages are classified asynchronously; outbound messages always have
+        `classification_status: completed` with a null `intent`.
+      required:
+        - id
+        - lead_id
+        - channel
+        - direction
+        - body
+        - status
+        - classification_status
+        - created_at
+      properties:
+        id:
+          type: string
+          description: Havana's internal message ID.
+          example: msg20260603zt5y8u2i6o1pa
+        lead_id:
+          type: string
+          description: Havana lead ID the message belongs to.
+          example: led20260512zr7k2m4xq9p3v
+        external_id:
+          type: ['string', 'null']
+          description: >-
+            Your CRM record ID for the lead this message belongs to. Null if
+            the lead has no CRM reference.
+          example: 00Q5f000001AbCdEAV
+        conversation_id:
+          type: ['string', 'null']
+          description: ID of the messaging conversation grouping this message.
+          example: mcv20260603zb4n7m1k9j5hg
+        channel:
+          type: string
+          description: Messaging channel the message was sent over.
+          enum:
+            - sms
+            - whatsapp
+          example: sms
+        direction:
+          type: string
+          description: '`outbound` (Havana to lead) or `inbound` (lead to Havana).'
+          enum:
+            - outbound
+            - inbound
+          example: inbound
+        body:
+          type: string
+          description: Message text content.
+          example: Yes I'm still interested, can you call me after 2pm?
+        status:
+          type: string
+          description: >-
+            Delivery state of the message, e.g. `queued`, `sent`, `delivered`,
+            or `failed`. Inbound messages report `delivered`.
+          example: delivered
+        sent_at:
+          type: ['string', 'null']
+          format: date-time
+          description: When the message was sent or received. Null while queued.
+          example: '2026-06-03T19:05:12Z'
+        read_at:
+          type: ['string', 'null']
+          format: date-time
+          description: WhatsApp read-receipt time. Null for SMS or unread messages.
+          example: null
+        delivery_error_code:
+          type: ['integer', 'null']
+          description: >-
+            Carrier error code when delivery failed (e.g. Twilio error code).
+            Null on success.
+          example: null
+        classification_status:
+          $ref: '#/components/schemas/ClassificationStatus'
+        intent:
+          description: >-
+            Classified intent for inbound messages. Null while pending and
+            always null for outbound messages.
+          anyOf:
+            - $ref: '#/components/schemas/MessagingIntent'
+            - type: 'null'
+          example: messaging_wants_call_back
+        created_at:
+          type: string
+          format: date-time
+          description: When the message record was created in Havana.
+          example: '2026-06-03T19:05:10Z'
+
+    Email:
+      type: object
+      description: >-
+        An inbound or outbound email exchanged with a lead. Inbound emails are
+        classified asynchronously; outbound emails always have
+        `classification_status: completed` with a null `intent`.
+      required:
+        - id
+        - lead_id
+        - direction
+        - classification_status
+        - created_at
+      properties:
+        id:
+          type: string
+          description: Havana's internal email ID.
+          example: eml20260528zw2e5r8t1y4ui
+        lead_id:
+          type: string
+          description: Havana lead ID the email belongs to.
+          example: led20260512zr7k2m4xq9p3v
+        external_id:
+          type: ['string', 'null']
+          description: >-
+            Your CRM record ID for the lead this email belongs to. Null if the
+            lead has no CRM reference.
+          example: 00Q5f000001AbCdEAV
+        direction:
+          type: string
+          description: '`outbound` (Havana to lead) or `inbound` (lead to Havana).'
+          enum:
+            - outbound
+            - inbound
+          example: outbound
+        subject:
+          type: ['string', 'null']
+          description: Email subject line.
+          example: Your RN-to-BSN application — next steps
+        body_text:
+          type: ['string', 'null']
+          description: Plain-text email body.
+          example: Hi Maria, following up on your inquiry about the RN-to-BSN program...
+        from_address:
+          type: ['string', 'null']
+          description: Sender email address.
+          example: advisor@school.usehavana.com
+        to_address:
+          type: ['string', 'null']
+          description: Recipient email address.
+          example: maria.santos@example.com
+        ccs:
+          type: ['string', 'null']
+          description: Comma-separated CC addresses, if any.
+          example: null
+        reply_to:
+          type: ['string', 'null']
+          description: Reply-To address, if set.
+          example: null
+        message_id:
+          type: ['string', 'null']
+          description: >-
+            RFC 5322 Message-ID of the email, usable for threading against your
+            own mail records.
+          example: <CADxyz123@mail.usehavana.com>
+        in_reply_to_message_id:
+          type: ['string', 'null']
+          description: RFC 5322 Message-ID of the parent email in the thread, if any.
+          example: null
+        sent_at:
+          type: ['string', 'null']
+          format: date-time
+          description: >-
+            When the email was sent (outbound) or received (inbound). Null for
+            outbound emails still queued.
+          example: '2026-05-28T13:00:02Z'
+        open_count:
+          type: ['integer', 'null']
+          description: >-
+            Number of tracked opens for outbound emails. Null for inbound
+            emails.
+          example: 2
+        is_bounce:
+          type: boolean
+          description: >-
+            True when this inbound email is a bounce notification attributed to
+            the lead's address.
+          example: false
+        is_manual:
+          type: boolean
+          description: True when a human sent this outbound email rather than the AI.
+          example: false
+        classification_status:
+          $ref: '#/components/schemas/ClassificationStatus'
+        intent:
+          description: >-
+            Classified intent for inbound emails. Null while pending and always
+            null for outbound emails.
+          anyOf:
+            - $ref: '#/components/schemas/EmailIntent'
+            - type: 'null'
+          example: null
+        created_at:
+          type: string
+          format: date-time
+          description: When the email record was created in Havana.
+          example: '2026-05-28T13:00:00Z'
+
+    Appointment:
+      type: object
+      description: >-
+        An appointment booked for a lead, either through a booking backend
+        (e.g. Calendly, Microsoft Bookings) or as a handoff scheduled during a
+        call or messaging conversation. `source_call_id` /
+        `source_conversation_id` identify which interaction produced the
+        booking.
+      required:
+        - id
+        - lead_id
+        - appointment_time
+        - timezone
+        - status
+        - booking_backend
+        - created_at
+        - updated_at
+      properties:
+        id:
+          type: string
+          description: Havana's internal appointment ID.
+          example: apt20260604zc6v9b3n7m2kl
+        lead_id:
+          type: string
+          description: Havana lead ID the appointment belongs to.
+          example: led20260512zr7k2m4xq9p3v
+        external_id:
+          type: ['string', 'null']
+          description: >-
+            Your CRM record ID for the lead this appointment belongs to. Null
+            if the lead has no CRM reference.
+          example: 00Q5f000001AbCdEAV
+        appointment_time:
+          type: string
+          format: date-time
+          description: The booked slot start time (UTC).
+          example: '2026-06-09T19:00:00Z'
+        timezone:
+          type: string
+          description: IANA time zone the slot was booked in.
+          example: America/Chicago
+        status:
+          type: string
+          description: Appointment lifecycle status, e.g. `booked` or `cancelled`.
+          example: booked
+        booking_backend:
+          type: string
+          description: >-
+            System that recorded the booking, e.g. `calendly`, `msbookings`, or
+            `handoff` for callbacks scheduled directly during a call, messaging
+            conversation, or booking page.
+          example: handoff
+        external_appointment_id:
+          type: ['string', 'null']
+          description: >-
+            ID of the appointment in the external booking system, when booked
+            through one. Null for handoff bookings.
+          example: null
+        source_call_id:
+          type: ['string', 'null']
+          description: >-
+            ID of the voice call during which the appointment was booked, if
+            any. Resolve via `GET /api/v1/calls/{id}`.
+          example: vca20260601z8h3n6tq2w5dy
+        source_conversation_id:
+          type: ['string', 'null']
+          description: >-
+            ID of the SMS/WhatsApp conversation through which the appointment
+            was booked, if any.
+          example: null
+        phone_number:
+          type: ['string', 'null']
+          description: Phone number to reach the lead at for the appointment (E.164).
+          example: '+13125550148'
+        meeting_url:
+          type: ['string', 'null']
+          description: Video/meeting URL for the appointment, when applicable.
+          example: null
+        reference_code:
+          type: ['string', 'null']
+          description: External reference code for the booking, when provided.
+          example: null
+        cancelled_at:
+          type: ['string', 'null']
+          format: date-time
+          description: When the appointment was cancelled. Null unless cancelled.
+          example: null
+        cancellation_reason:
+          type: ['string', 'null']
+          description: Free-text reason recorded at cancellation. Null unless cancelled.
+          example: null
+        created_at:
+          type: string
+          format: date-time
+          description: When the appointment record was created in Havana.
+          example: '2026-06-01T16:24:40Z'
+        updated_at:
+          type: string
+          format: date-time
+          description: When the appointment record was last modified.
+          example: '2026-06-01T16:24:40Z'
+
+    ThreadCallItem:
+      type: object
+      description: A voice call entry in a lead's interleaved engagement thread.
+      required:
+        - type
+        - occurred_at
+        - classification_status
+        - call
+      properties:
+        type:
+          type: string
+          description: Discriminator. Always `call` for this variant.
+          const: call
+          example: call
+        occurred_at:
+          type: string
+          format: date-time
+          description: When the call happened. Uniform interleaving sort key across channels.
+          example: '2026-06-01T16:20:05Z'
+        classification_status:
+          $ref: '#/components/schemas/ClassificationStatus'
+        intent:
+          description: Classified call outcome. Null while pending.
+          anyOf:
+            - $ref: '#/components/schemas/VoiceIntent'
+            - type: 'null'
+          example: voice_interested_with_booked_time
+        call:
+          $ref: '#/components/schemas/Call'
+
+    ThreadMessageItem:
+      type: object
+      description: An SMS/WhatsApp message entry in a lead's interleaved engagement thread.
+      required:
+        - type
+        - occurred_at
+        - classification_status
+        - message
+      properties:
+        type:
+          type: string
+          description: Discriminator. Always `message` for this variant.
+          const: message
+          example: message
+        occurred_at:
+          type: string
+          format: date-time
+          description: When the message was sent or received. Uniform interleaving sort key.
+          example: '2026-06-03T19:05:12Z'
+        classification_status:
+          $ref: '#/components/schemas/ClassificationStatus'
+        intent:
+          description: >-
+            Classified intent for inbound messages. Null while pending or for
+            outbound messages.
+          anyOf:
+            - $ref: '#/components/schemas/MessagingIntent'
+            - type: 'null'
+          example: messaging_wants_call_back
+        message:
+          $ref: '#/components/schemas/Message'
+
+    ThreadEmailItem:
+      type: object
+      description: An email entry in a lead's interleaved engagement thread.
+      required:
+        - type
+        - occurred_at
+        - classification_status
+        - email
+      properties:
+        type:
+          type: string
+          description: Discriminator. Always `email` for this variant.
+          const: email
+          example: email
+        occurred_at:
+          type: string
+          format: date-time
+          description: When the email was sent or received. Uniform interleaving sort key.
+          example: '2026-05-28T13:00:02Z'
+        classification_status:
+          $ref: '#/components/schemas/ClassificationStatus'
+        intent:
+          description: >-
+            Classified intent for inbound emails. Null while pending or for
+            outbound emails.
+          anyOf:
+            - $ref: '#/components/schemas/EmailIntent'
+            - type: 'null'
+          example: null
+        email:
+          $ref: '#/components/schemas/Email'
+
+    ThreadItem:
+      description: >-
+        One entry in a lead's full interleaved engagement transcript. A
+        discriminated union over calls, messages, and emails — discriminate on
+        the `type` field. Each variant carries its classification alongside the
+        channel payload.
+      oneOf:
+        - $ref: '#/components/schemas/ThreadCallItem'
+        - $ref: '#/components/schemas/ThreadMessageItem'
+        - $ref: '#/components/schemas/ThreadEmailItem'
+      discriminator:
+        propertyName: type
+        mapping:
+          call: '#/components/schemas/ThreadCallItem'
+          message: '#/components/schemas/ThreadMessageItem'
+          email: '#/components/schemas/ThreadEmailItem'
+
+    Thread:
+      type: object
+      description: >-
+        The full engagement transcript for a lead: every call, SMS/WhatsApp
+        message, and email interleaved in chronological order, each with its
+        classification. Returned by `GET /api/v1/leads/{external_id}/thread`.
+        The `items` array is cursor-paginated; pass `next_cursor` back as the
+        `cursor` query parameter to fetch the next page of entries.
+      required:
+        - lead_id
+        - status
+        - items
+        - next_cursor
+      properties:
+        lead_id:
+          type: string
+          description: Havana lead ID this thread belongs to.
+          example: led20260512zr7k2m4xq9p3v
+        external_id:
+          type: ['string', 'null']
+          description: >-
+            Your CRM record ID for the lead. Null if the lead has no CRM
+            reference.
+          example: 00Q5f000001AbCdEAV
+        status:
+          $ref: '#/components/schemas/LeadStatus'
+        intent:
+          description: Latest classified intent for the thread. Null until first classification.
+          anyOf:
+            - $ref: '#/components/schemas/Intent'
+            - type: 'null'
+          example: voice_interested_with_booked_time
+        started_at:
+          type: ['string', 'null']
+          format: date-time
+          description: When outreach to the lead actually began. Null if not yet started.
+          example: '2026-05-13T15:00:00Z'
+        last_activity_at:
+          type: ['string', 'null']
+          format: date-time
+          description: Timestamp of the most recent engagement across all channels.
+          example: '2026-06-03T19:05:12Z'
+        extracted_metadata:
+          type: array
+          description: >-
+            Structured fields Havana's AI extracted from the conversation, such
+            as rejection reasons or programs of interest.
+          items:
+            $ref: '#/components/schemas/ExtractedMetadata'
+        items:
+          type: array
+          description: >-
+            Chronologically ordered engagement entries across voice, SMS,
+            WhatsApp, and email (oldest first).
+          items:
+            $ref: '#/components/schemas/ThreadItem'
+        next_cursor:
+          type: ['string', 'null']
+          description: >-
+            Opaque cursor for the next page of `items`. Null when no further
+            entries exist.
+          example: null
+
+    ExtractedMetadata:
+      type: object
+      description: >-
+        A structured field extracted by Havana's AI from a lead's
+        conversations. Field names are configured per team (e.g.
+        `rejection_reason`, `interested_courses`); values are re-extracted as
+        new conversation artifacts arrive.
+      required:
+        - field_name
+        - values
+        - extracted_at
+      properties:
+        field_name:
+          type: string
+          description: Name of the extracted field, as configured for your team.
+          example: rejection_reason
+        values:
+          type: array
+          description: Extracted values for the field. Empty when nothing was extracted.
+          items:
+            type: string
+            description: A single extracted value.
+            example: Finances
+          example:
+            - Finances
+            - Timing
+        extracted_at:
+          type: string
+          format: date-time
+          description: When this extraction was last computed.
+          example: '2026-06-03T19:10:00Z'
+
+    Error:
+      type: object
+      description: >-
+        Standard error envelope returned by every non-2xx response.
+      required:
+        - code
+        - message
+      properties:
+        code:
+          type: string
+          description: >-
+            Machine-readable error code, e.g. `unauthorized`, `not_found`,
+            `invalid_cursor`, `rate_limited`, `validation_failed`.
+          example: not_found
+        message:
+          type: string
+          description: Human-readable description of the error.
+          example: No lead found with external_id 00Q5f000001AbCdEAV.
+        detail:
+          type: ['object', 'null']
+          description: >-
+            Optional structured context for the error (e.g. the offending
+            parameter). Null when there is nothing to add.
+          additionalProperties: true
+          example:
+            parameter: external_id
+
+    PaginatedLeads:
+      type: object
+      description: >-
+        Cursor-paginated page of leads. Pass `next_cursor` back as the `cursor`
+        query parameter to fetch the next page; a null `next_cursor` means you
+        have reached the end of the result set.
+      required:
+        - data
+        - next_cursor
+      properties:
+        data:
+          type: array
+          description: Leads in this page, ordered by `updated_at` ascending.
+          items:
+            $ref: '#/components/schemas/Lead'
+        next_cursor:
+          type: ['string', 'null']
+          description: >-
+            Opaque cursor for the next page. Null when no further results
+            exist.
+          example: eyJ1cGRhdGVkX2F0IjoiMjAyNi0wNi0wOVQxODo0NTozMVoifQ
+        has_more:
+          type: boolean
+          description: True when more results are available beyond this page.
+          example: true
+
+    PaginatedActivities:
+      type: object
+      description: >-
+        Cursor-paginated page of activities for a lead. Pass `next_cursor` back
+        as the `cursor` query parameter to fetch the next page; a null
+        `next_cursor` means you have reached the end of the result set.
+      required:
+        - data
+        - next_cursor
+      properties:
+        data:
+          type: array
+          description: Activities in this page, ordered newest first.
+          items:
+            $ref: '#/components/schemas/Activity'
+        next_cursor:
+          type: ['string', 'null']
+          description: >-
+            Opaque cursor for the next page. Null when no further results
+            exist.
+          example: eyJvY2N1cnJlZF9hdCI6IjIwMjYtMDYtMDNUMTk6MDU6MTJaIn0
+        has_more:
+          type: boolean
+          description: True when more results are available beyond this page.
+          example: false
+
+    PaginatedAppointments:
+      type: object
+      description: >-
+        Cursor-paginated page of appointments for a lead. Pass `next_cursor`
+        back as the `cursor` query parameter to fetch the next page; a null
+        `next_cursor` means you have reached the end of the result set.
+      required:
+        - data
+        - next_cursor
+      properties:
+        data:
+          type: array
+          description: Appointments in this page, ordered newest first.
+          items:
+            $ref: '#/components/schemas/Appointment'
+        next_cursor:
+          type: ['string', 'null']
+          description: >-
+            Opaque cursor for the next page. Null when no further results
+            exist.
+          example: null
+        has_more:
+          type: boolean
+          description: True when more results are available beyond this page.
+          example: false
+
+    WebhookEnvelope:
+      type: object
+      description: >-
+        Thin webhook event delivered to your endpoint. Events carry IDs and a
+        per-lead monotonic sequence number — not full resource state; on
+        receipt, pull the referenced resource (or run your `updated_since`
+        delta poll) to get the source of truth. Payloads are signed with
+        HMAC-SHA256 of the raw request body using your endpoint's signing
+        secret, delivered in the `X-Havana-Signature` header (format:
+        `t=<unix_ts>,v1=<hex digest>`; the digest is computed over
+        `<unix_ts>.<raw body>`; multiple `v1=` entries may be present during
+        secret rotation — any match is valid). Delivery is at-least-once:
+        deduplicate on the
+        top-level `id` or on (`lead_id`, `sequence`). `call.completed` fires
+        immediately with classification still pending; `lead.classified`
+        follows when the async classifier lands.
+      required:
+        - id
+        - type
+        - sequence
+        - occurred_at
+        - data
+      properties:
+        id:
+          type: string
+          description: Unique event ID. Use for idempotent processing of redeliveries.
+          example: evt20260601zh7j4k1l8p5qw
+        type:
+          type: string
+          description: Event type that occurred.
+          enum:
+            - lead.status_changed
+            - lead.classified
+            - call.completed
+            - lead.unsubscribed
+            - handoff.requested
+          example: call.completed
+        sequence:
+          type: integer
+          description: >-
+            Per-lead monotonically increasing sequence number. Discard any
+            event whose sequence is lower than the highest you have already
+            processed for that lead; deliveries may arrive out of order.
+            Sequence numbers may have gaps; gaps are not errors.
+          example: 7
+        occurred_at:
+          type: string
+          format: date-time
+          description: When the underlying event happened in Havana.
+          example: '2026-06-01T16:24:51Z'
+        data:
+          type: object
+          description: >-
+            Thin event payload — identifiers plus the minimal fields describing
+            what changed. Fetch the referenced resource via the pull API for
+            full state.
+          required:
+            - lead_id
+          properties:
+            lead_id:
+              type: string
+              description: Havana lead ID the event relates to.
+              example: led20260512zr7k2m4xq9p3v
+            external_id:
+              type: ['string', 'null']
+              description: >-
+                Your CRM record ID for the lead. Null if the lead has no CRM
+                reference.
+              example: 00Q5f000001AbCdEAV
+            call_id:
+              type: ['string', 'null']
+              description: >-
+                Havana call ID for `call.completed`, voice-channel
+                `lead.classified`, and `handoff.requested` events triggered
+                from a call. Resolve via `GET /api/v1/calls/{id}`. Null
+                otherwise.
+              example: vca20260601z8h3n6tq2w5dy
+            appointment_id:
+              type: ['string', 'null']
+              description: >-
+                Havana appointment ID for `handoff.requested` events that carry
+                a scheduled callback. Null otherwise.
+              example: apt20260604zc6v9b3n7m2kl
+            activity_id:
+              type: ['string', 'null']
+              description: >-
+                Havana activity ID of the classified engagement, for
+                `lead.classified` and `handoff.requested` events. Null
+                otherwise.
+              example: act20260601zq8w3e7r2t9yu
+            channel:
+              description: >-
+                Channel of the engagement that produced the event, for
+                `lead.classified`, `lead.unsubscribed`, and `handoff.requested`
+                events. Null otherwise.
+              anyOf:
+                - $ref: '#/components/schemas/Channel'
+                - type: 'null'
+              example: voice
+            status:
+              description: >-
+                New lead status, for `lead.status_changed` and
+                `lead.unsubscribed` events. Null otherwise.
+              anyOf:
+                - $ref: '#/components/schemas/LeadStatus'
+                - type: 'null'
+              example: interested
+            previous_status:
+              description: >-
+                Previous lead status, for `lead.status_changed` events. Null
+                otherwise.
+              anyOf:
+                - $ref: '#/components/schemas/LeadStatus'
+                - type: 'null'
+              example: replied
+            classification_status:
+              description: >-
+                Classification state of the referenced engagement, for
+                `call.completed` (always `pending`) and `lead.classified`
+                (always `completed`) events. Null otherwise.
+              anyOf:
+                - $ref: '#/components/schemas/ClassificationStatus'
+                - type: 'null'
+              example: pending
+            intent:
+              description: >-
+                Resolved intent, for `lead.classified`, `lead.unsubscribed`,
+                and `handoff.requested` events. Always null on
+                `call.completed` (classification is still pending).
+              anyOf:
+                - $ref: '#/components/schemas/Intent'
+                - type: 'null'
+              example: voice_interested_with_booked_time
+            call_status:
+              type: ['string', 'null']
+              description: >-
+                Terminal call delivery status, for `call.completed` events.
+                Null otherwise.
+              example: completed
+            is_callback:
+              type: ['boolean', 'null']
+              description: >-
+                Whether the completed call was a scheduled callback, for
+                `call.completed` events. Null otherwise.
+              example: false

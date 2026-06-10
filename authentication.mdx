@@ -1,0 +1,47 @@
+---
+title: "Authentication"
+description: "Authenticate with per-team API keys"
+---
+
+Every request to the Havana Public API is authenticated with a **per-team API key** passed as a Bearer token:
+
+```bash
+curl https://api.usehavana.com/api/v1/leads?limit=1 \
+  -H "Authorization: Bearer hav_XXXXXXXXXXXXXXXXXXXXXXXX"
+```
+
+Keys start with the `hav_` prefix. A key is scoped to a single team (tenant): every record the API returns belongs to the authenticated team, and lead lookups by `external_id` only resolve within that team.
+
+## Getting a key
+
+API keys are issued by Havana. Contact your Havana account manager or [support@usehavana.com](mailto:support@usehavana.com) to have a key provisioned for your team. Store it in your secrets manager as soon as you receive it — treat it like a password.
+
+## Rotation
+
+Keys can be rotated from the Havana dashboard. Rotation issues a new `hav_` key; update your integration with the new key, then revoke the old one. If you believe a key has been exposed, rotate it immediately and contact [support@usehavana.com](mailto:support@usehavana.com).
+
+## Keep keys server-side
+
+<Warning>
+  Never use an API key in client-side code — browsers, mobile apps, or anything else you ship to end users. Keys grant read access to your team's entire lead dataset, including transcripts and contact details. Call the API only from your servers.
+</Warning>
+
+A few rules of thumb:
+
+- Store keys in environment variables or a secrets manager, never in source control.
+- Use one key per integration so you can rotate or revoke them independently.
+- Webhook signing secrets are separate from API keys — see [Webhooks](/guides/webhooks).
+
+## Failed authentication
+
+Requests with a missing or invalid key return `401` with the standard error envelope:
+
+```json
+{
+  "code": "unauthorized",
+  "message": "Invalid or missing API key.",
+  "detail": {
+    "hint": "Provide a valid key in the Authorization header: Bearer hav_..."
+  }
+}
+```
