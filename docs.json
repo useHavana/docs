@@ -3,9 +3,9 @@
   "theme": "mint",
   "name": "Havana",
   "colors": {
-    "primary": "#16A34A",
-    "light": "#07C983",
-    "dark": "#15803D"
+    "primary": "#214EFF",
+    "light": "#6E8BFF",
+    "dark": "#1A3ECC"
   },
   "favicon": "/favicon.svg",
   "navigation": {
@@ -32,8 +32,8 @@
     ]
   },
   "logo": {
-    "light": "/logo/light.svg",
-    "dark": "/logo/dark.svg"
+    "light": "/logo/light.png",
+    "dark": "/logo/dark.png"
   },
   "navbar": {
     "links": [
