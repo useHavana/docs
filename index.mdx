@@ -43,6 +43,7 @@ Reads, webhooks, and campaign-scoped lead upload:
 | `GET /api/v1/leads/{external_id}/appointments` | Appointments booked for the lead |
 | `GET /api/v1/campaigns` | Campaign discovery — find the campaign to upload into |
 | `POST /api/v1/campaigns/{campaign_id}/leads` | Upload up to 500 leads into a campaign (upsert + enroll) |
+| `POST /api/v1/leads/{external_id}/stop` | Stop working a lead (converted, enrolled elsewhere, do-not-work) |
 
 Webhook events: `lead.status_changed`, `lead.classified`, `call.completed`, `lead.unsubscribed`, `handoff.requested`.
 

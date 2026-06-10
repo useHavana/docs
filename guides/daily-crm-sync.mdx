@@ -249,6 +249,30 @@ The entire design assumes **re-processing is free**:
 
 Concretely: match on `external_id`, overwrite fields rather than appending, and never use insert-only writes. If your CRM write path can't tolerate replays, fix that before tuning anything else.
 
+## Close the loop when leads convert
+
+The sync is two-directional: when a lead reaches a terminal stage in *your*
+CRM — converted, enrolled elsewhere, marked do-not-work — tell Havana to stop
+working it:
+
+```bash
+curl -X POST https://api.usehavana.com/api/v1/leads/00Q5f000001AbCdEAV/stop \
+  -H "Authorization: Bearer hav_your_key" \
+  -H "Content-Type: application/json" \
+  -d '{"reason": "converted"}'
+```
+
+The lead's status moves to `intentionally_stopped`, outreach halts, and the
+change flows back through the same loop you already built: a
+`lead.status_changed` webhook fires and the lead resurfaces in your next
+delta poll. Wire this into your CRM's stage-change automation so a lead never
+gets a Havana call the day after they enrolled.
+
+<Note>
+  Stop is a business decision, not an unsubscribe — DNC (`unsubscribed`) is
+  reserved for the lead's own opt-out and can't be set through the API.
+</Note>
+
 ## Common mistakes
 
 <Warning>

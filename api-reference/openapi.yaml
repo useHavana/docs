@@ -158,6 +158,9 @@ paths:
                     invalid_number: false
                     is_inbound: false
                     is_test: false
+                    campaign_id: cam20260301zq8w4e7r2t9yu
+                    campaign_name: RN-to-BSN Spring Re-engagement
+                    assigned_rep_email: avery.brown@university.edu
                     custom_fields:
                       inquiry_age_c: '14'
                       program_of_interest: RN-to-BSN
@@ -189,6 +192,9 @@ paths:
                     invalid_number: false
                     is_inbound: false
                     is_test: false
+                    campaign_id: cam20260418zbsno5x1c3vpn
+                    campaign_name: BSN Online Aged Leads
+                    assigned_rep_email: null
                     custom_fields:
                       program_of_interest: BSN Online
                     counts:
@@ -252,6 +258,9 @@ paths:
                 invalid_number: false
                 is_inbound: false
                 is_test: false
+                campaign_id: cam20260301zq8w4e7r2t9yu
+                campaign_name: RN-to-BSN Spring Re-engagement
+                assigned_rep_email: avery.brown@university.edu
                 custom_fields:
                   inquiry_age_c: '14'
                   program_of_interest: RN-to-BSN
@@ -390,6 +399,8 @@ paths:
               example:
                 lead_id: led20260512zr7k2m4xq9p3v
                 external_id: 00Q5f000001AbCdEAV
+                campaign_id: cam20260301zq8w4e7r2t9yu
+                campaign_name: RN-to-BSN Spring Re-engagement
                 status: interested
                 intent: voice_interested_with_booked_time
                 started_at: '2026-05-13T15:00:00Z'
@@ -589,6 +600,102 @@ paths:
                     updated_at: '2026-06-01T16:24:40Z'
                 next_cursor: null
                 has_more: false
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /api/v1/leads/{external_id}/stop:
+    post:
+      operationId: stopLead
+      tags: [Leads]
+      summary: Stop working a lead
+      description: |
+        Permanently stops Havana outreach to this lead in its current
+        campaign. Use it when the lead converted, enrolled elsewhere, or
+        should no longer be worked for any business reason — typically called
+        from your CRM automation the moment a lead reaches a terminal stage
+        on your side.
+
+        The lead's status moves to `intentionally_stopped`, a
+        `lead.status_changed` webhook fires, and the lead's `updated_at` is
+        bumped so your next delta poll sees the change. The lead and its full
+        engagement history remain readable through every read endpoint.
+
+        **Stop is terminal for the current campaign thread.** Re-uploading
+        the lead into the *same* campaign returns `already_in_campaign` and
+        the thread stays stopped. Deliberate re-engagement later (e.g. a new
+        intake term) is done by uploading the lead into a *different*
+        campaign, which starts a fresh thread.
+
+        **This is not an unsubscribe.** Stop records a business decision;
+        DNC/opt-out (`unsubscribed`) is reserved for the lead's own request
+        and cannot be set — or cleared — through this endpoint.
+
+        Idempotent: stopping an already-stopped lead returns `200` and
+        changes nothing.
+      parameters:
+        - $ref: '#/components/parameters/ExternalId'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason:
+                  type: ['string', 'null']
+                  maxLength: 500
+                  description: >-
+                    Optional free-text reason recorded for reporting (e.g.
+                    `converted`, `enrolled_elsewhere`). Not shown to the lead.
+                  example: converted
+            example:
+              reason: converted
+      responses:
+        '200':
+          description: 'The lead after stopping, with `status: intentionally_stopped`.'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Lead'
+              example:
+                id: led20260512zr7k2m4xq9p3v
+                external_id: 00Q5f000001AbCdEAV
+                status: intentionally_stopped
+                intent: voice_interested
+                first_name: Maria
+                last_name: Santos
+                email: maria.santos@example.com
+                phone_number: '+13125550148'
+                import_source: salesforce
+                external_status: Working - Contacted
+                external_synced_at: '2026-06-09T14:02:11Z'
+                time_zone: America/Chicago
+                state: IL
+                unsubscribed: false
+                bounced: false
+                invalid_number: false
+                is_inbound: false
+                is_test: false
+                campaign_id: cam20260301zq8w4e7r2t9yu
+                campaign_name: RN-to-BSN Spring Re-engagement
+                assigned_rep_email: avery.brown@university.edu
+                custom_fields:
+                  inquiry_age_c: '14'
+                  program_of_interest: RN-to-BSN
+                counts:
+                  calls: 4
+                  calls_answered: 1
+                  emails_sent: 3
+                  emails_received: 1
+                  email_opens: 5
+                  messages_sent: 2
+                  messages_received: 1
+                created_at: '2026-05-12T09:30:00Z'
+                updated_at: '2026-06-11T08:02:14Z'
         '401':
           $ref: '#/components/responses/Unauthorized'
         '404':
@@ -1462,6 +1569,24 @@ components:
             excluded from Havana reporting; filter on this field if you do not
             want them in your CRM.
           example: false
+        campaign_id:
+          type: ['string', 'null']
+          description: >-
+            Havana campaign this lead is enrolled in. Null when the lead is
+            not enrolled in any campaign.
+          example: cam20260301zq8w4e7r2t9yu
+        campaign_name:
+          type: ['string', 'null']
+          description: >-
+            Human-readable name of the enrolled campaign — write this to your
+            CRM if you track which Havana campaign owns the lead.
+          example: RN-to-BSN Spring Re-engagement
+        assigned_rep_email:
+          type: ['string', 'null']
+          description: >-
+            Email of the rep this lead belongs to in Havana (the rep whose
+            name outreach is sent on behalf of). Null when unassigned.
+          example: avery.brown@university.edu
         custom_fields:
           type: object
           description: >-
@@ -2160,6 +2285,14 @@ components:
             Your CRM record ID for the lead. Null if the lead has no CRM
             reference.
           example: 00Q5f000001AbCdEAV
+        campaign_id:
+          type: ['string', 'null']
+          description: Havana campaign this thread belongs to.
+          example: cam20260301zq8w4e7r2t9yu
+        campaign_name:
+          type: ['string', 'null']
+          description: Human-readable name of the campaign this thread belongs to.
+          example: RN-to-BSN Spring Re-engagement
         status:
           $ref: '#/components/schemas/LeadStatus'
         intent:
