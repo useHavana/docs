@@ -45,7 +45,7 @@ curl "https://api.usehavana.com/api/v1/leads?updated_since=2026-06-09T00:00:00Z&
       "intent": "voice_interested_with_booked_time",
       "first_name": "Maria",
       "last_name": "Santos",
-      "unsubscribed": false,
+      "is_unsubscribed": false,
       "counts": {
         "calls": 4,
         "calls_answered": 1,
@@ -198,7 +198,7 @@ def upsert_into_crm(lead: dict) -> None:
             # bump, so never hard-key on the status enum
             "Havana_Status__c": STATUS_TO_STAGE.get(lead["status"], "Needs Review"),
             "Havana_Intent__c": lead["intent"],          # null until classified
-            "Havana_Unsubscribed__c": lead["unsubscribed"],
+            "Havana_Unsubscribed__c": lead["is_unsubscribed"],
             "Havana_Calls__c": lead["counts"]["calls"],
             "Havana_Calls_Answered__c": lead["counts"]["calls_answered"],
             "Havana_Last_Synced__c": lead["updated_at"],

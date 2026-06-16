@@ -153,15 +153,15 @@ paths:
                     external_synced_at: '2026-06-09T14:02:11Z'
                     time_zone: America/Chicago
                     state: IL
-                    unsubscribed: false
-                    bounced: false
-                    invalid_number: false
+                    is_unsubscribed: false
+                    is_bounced: false
+                    is_invalid_number: false
                     is_inbound: false
                     is_test: false
                     campaign_id: cam20260301zq8w4e7r2t9yu
                     campaign_name: RN-to-BSN Spring Re-engagement
                     assigned_rep_email: avery.brown@university.edu
-                    custom_fields:
+                    custom_attributes:
                       inquiry_age_c: '14'
                       program_of_interest: RN-to-BSN
                     counts:
@@ -187,15 +187,15 @@ paths:
                     external_synced_at: null
                     time_zone: America/New_York
                     state: OH
-                    unsubscribed: false
-                    bounced: false
-                    invalid_number: false
+                    is_unsubscribed: false
+                    is_bounced: false
+                    is_invalid_number: false
                     is_inbound: false
                     is_test: false
                     campaign_id: cam20260418zbsno5x1c3vpn
                     campaign_name: BSN Online Aged Leads
                     assigned_rep_email: null
-                    custom_fields:
+                    custom_attributes:
                       program_of_interest: BSN Online
                     counts:
                       calls: 1
@@ -253,15 +253,15 @@ paths:
                 external_synced_at: '2026-06-09T14:02:11Z'
                 time_zone: America/Chicago
                 state: IL
-                unsubscribed: false
-                bounced: false
-                invalid_number: false
+                is_unsubscribed: false
+                is_bounced: false
+                is_invalid_number: false
                 is_inbound: false
                 is_test: false
                 campaign_id: cam20260301zq8w4e7r2t9yu
                 campaign_name: RN-to-BSN Spring Re-engagement
                 assigned_rep_email: avery.brown@university.edu
-                custom_fields:
+                custom_attributes:
                   inquiry_age_c: '14'
                   program_of_interest: RN-to-BSN
                 counts:
@@ -410,7 +410,7 @@ paths:
                     values:
                       - RN-to-BSN
                     extracted_at: '2026-06-08T19:10:00Z'
-                items:
+                data:
                   - type: email
                     occurred_at: '2026-05-28T13:00:02Z'
                     classification_status: completed
@@ -475,7 +475,7 @@ paths:
                       transcript: "Agent: Hi, may I speak with Maria?\nUser: Speaking."
                       transcript_summary: null
                       recording_url: https://api.usehavana.com/v1/recordings/vca20260609z8h3n6tq2w5dy?sig=abc123
-                      voicemail_detected: false
+                      is_voicemail_detected: false
                       is_callback: true
                       is_transferred: false
                       transfer_status: null
@@ -484,6 +484,7 @@ paths:
                       intent: null
                       created_at: '2026-06-09T14:21:40Z'
                 next_cursor: null
+                has_more: false
         '401':
           $ref: '#/components/responses/Unauthorized'
         '404':
@@ -540,7 +541,7 @@ paths:
                   Lead confirmed interest and booked a callback for Tuesday 2pm
                   CT.
                 recording_url: https://api.usehavana.com/v1/recordings/vca20260601z8h3n6tq2w5dy?sig=abc123
-                voicemail_detected: false
+                is_voicemail_detected: false
                 is_callback: true
                 is_transferred: false
                 transfer_status: null
@@ -584,7 +585,7 @@ paths:
                   - id: apt20260604zc6v9b3n7m2kl
                     lead_id: led20260512zr7k2m4xq9p3v
                     external_id: 00Q5f000001AbCdEAV
-                    appointment_time: '2026-06-09T19:00:00Z'
+                    scheduled_at: '2026-06-09T19:00:00Z'
                     timezone: America/Chicago
                     status: booked
                     booking_backend: handoff
@@ -675,15 +676,15 @@ paths:
                 external_synced_at: '2026-06-09T14:02:11Z'
                 time_zone: America/Chicago
                 state: IL
-                unsubscribed: false
-                bounced: false
-                invalid_number: false
+                is_unsubscribed: false
+                is_bounced: false
+                is_invalid_number: false
                 is_inbound: false
                 is_test: false
                 campaign_id: cam20260301zq8w4e7r2t9yu
                 campaign_name: RN-to-BSN Spring Re-engagement
                 assigned_rep_email: avery.brown@university.edu
-                custom_fields:
+                custom_attributes:
                   inquiry_age_c: '14'
                   program_of_interest: RN-to-BSN
                 counts:
@@ -727,11 +728,11 @@ paths:
                 data:
                   - id: cam20260301zq8w4e7r2t9yu
                     name: RN-to-BSN Spring Re-engagement
-                    enabled: true
+                    is_enabled: true
                     created_at: '2026-03-01T09:12:00Z'
                   - id: cam20260418zbsno5x1c3vpn
                     name: BSN Online Aged Leads
-                    enabled: false
+                    is_enabled: false
                     created_at: '2026-04-18T14:03:22Z'
                 next_cursor: null
                 has_more: false
@@ -1471,9 +1472,9 @@ components:
         - status
         - created_at
         - import_source
-        - unsubscribed
-        - bounced
-        - invalid_number
+        - is_unsubscribed
+        - is_bounced
+        - is_invalid_number
         - is_inbound
       properties:
         id:
@@ -1542,17 +1543,17 @@ components:
           type: ['string', 'null']
           description: US state used for time zone and calling-window rules.
           example: IL
-        unsubscribed:
+        is_unsubscribed:
           type: boolean
           description: >-
             True if the lead opted out of contact (DNC). Mirrors the
             `unsubscribed` thread status and the `lead.unsubscribed` webhook.
           example: false
-        bounced:
+        is_bounced:
           type: boolean
           description: True if the lead's email address hard-bounced.
           example: false
-        invalid_number:
+        is_invalid_number:
           type: boolean
           description: True if the lead's phone number was found to be invalid.
           example: false
@@ -1587,7 +1588,7 @@ components:
             Email of the rep this lead belongs to in Havana (the rep whose
             name outreach is sent on behalf of). Null when unassigned.
           example: avery.brown@university.edu
-        custom_fields:
+        custom_attributes:
           type: object
           description: >-
             Custom and imported fields carried with the lead, keyed by field
@@ -1732,7 +1733,7 @@ components:
         - direction
         - is_callback
         - is_transferred
-        - voicemail_detected
+        - is_voicemail_detected
         - classification_status
         - created_at
       properties:
@@ -1809,7 +1810,7 @@ components:
             Time-limited signed URL to the call recording audio. Null when no
             recording exists. Re-fetch the call to obtain a fresh URL.
           example: https://api.usehavana.com/v1/recordings/vca20260601z8h3n6tq2w5dy?sig=abc123
-        voicemail_detected:
+        is_voicemail_detected:
           type: boolean
           description: True if the call reached voicemail.
           example: false
@@ -2059,7 +2060,7 @@ components:
       required:
         - id
         - lead_id
-        - appointment_time
+        - scheduled_at
         - timezone
         - status
         - booking_backend
@@ -2080,7 +2081,7 @@ components:
             Your CRM record ID for the lead this appointment belongs to. Null
             if the lead has no CRM reference.
           example: 00Q5f000001AbCdEAV
-        appointment_time:
+        scheduled_at:
           type: string
           format: date-time
           description: The booked slot start time (UTC).
@@ -2272,7 +2273,7 @@ components:
       required:
         - lead_id
         - status
-        - items
+        - data
         - next_cursor
       properties:
         lead_id:
@@ -2318,7 +2319,7 @@ components:
             as rejection reasons or programs of interest.
           items:
             $ref: '#/components/schemas/ExtractedMetadata'
-        items:
+        data:
           type: array
           description: >-
             Chronologically ordered engagement entries across voice, SMS,
@@ -2328,9 +2329,13 @@ components:
         next_cursor:
           type: ['string', 'null']
           description: >-
-            Opaque cursor for the next page of `items`. Null when no further
+            Opaque cursor for the next page of `data`. Null when no further
             entries exist.
           example: null
+        has_more:
+          type: boolean
+          description: True when more thread entries are available beyond this page.
+          example: false
 
     ExtractedMetadata:
       type: object
@@ -2623,7 +2628,7 @@ components:
       required:
         - id
         - name
-        - enabled
+        - is_enabled
         - created_at
       properties:
         id:
@@ -2634,7 +2639,7 @@ components:
           type: string
           description: Human-readable campaign name as shown in the dashboard.
           example: RN-to-BSN Spring Re-engagement
-        enabled:
+        is_enabled:
           type: boolean
           description: >-
             Whether the campaign is currently running. Leads can be uploaded
